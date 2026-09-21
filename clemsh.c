@@ -97,6 +97,7 @@ int execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
             if (prev_fd != -1){
                 // dup2 duplicattes a file descriptor and assigns it a user defined number 
                 if (dup2(prev_fd, STDIN_FILENO) == -1){
+                    //ERROR HANDLING
                     perror("dup2");
                     _exit(EXIT_FAILURE);
                 }
@@ -105,6 +106,7 @@ int execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
             // connect write end of pipe to std out
             if (i < pipeline->command_count - 1){ 
                 if (dup2(pipe_fd[PIPE_WRITE_END], STDOUT_FILENO) == -1){
+                    //ERROR HANDLING
                     perror("dup2");
                     _exit(EXIT_FAILURE);
                 }
@@ -127,11 +129,13 @@ int execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
                 // open a file for reading
                 int fd_in = open(pipeline->commands[i].input.path, O_RDONLY);
                 if (fd_in == -1){
+                    //ERROR HANDLING
                     perror("open");
                     _exit(EXIT_FAILURE);
                 }
                 // if possible duplicate its contnet to STDIN
                 if (dup2(fd_in, STDIN_FILENO) == -1){
+                    //ERROR HANDLING
                     perror("dup2");
                     _exit(EXIT_FAILURE);
                 }
@@ -141,10 +145,12 @@ int execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
             if (pipeline->commands[i].output.type == REDIRECT_FILE){
                 int fd_out = open(pipeline->commands[i].output.path, O_WRONLY | O_CREAT | O_TRUNC, 0664);
                 if (fd_out == -1){
+                    //ERROR HANDLING
                     perror("open");
                     _exit(EXIT_FAILURE);
                 }
                 if (dup2(fd_out, STDOUT_FILENO) == -1){
+                    //ERROR HANDLING
                     perror("dup2");
                     _exit(EXIT_FAILURE);
                 }
@@ -162,6 +168,7 @@ int execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
                 snprintf(port_str, sizeof(port_str), "%u", pipeline->commands[i].input.port); //string port must be a string 
                 int error = getaddrinfo(pipeline->commands[i].input.host, port_str, &hints, &pfirstResult);
                 if(error){
+                    //ERROR HANDLING
                     fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(error));
                     _exit(EXIT_FAILURE);
                 }
@@ -177,11 +184,13 @@ int execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
                     }
                     freeaddrinfo(pfirstResult);
                 if (sockfd == -1){
+                    //ERROR HANDLING
                     perror("connect failed!");
                     _exit(EXIT_FAILURE); 
                 }
                 //final part once socket is setup and connected
                 if (dup2(sockfd, STDIN_FILENO) == -1){
+                    //ERROR HANDLING
                     perror("dup2");
                     _exit(EXIT_FAILURE);
                 }
@@ -213,11 +222,13 @@ int execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
                     }
                     freeaddrinfo(pfirstResult);
                 if (sockfd == -1){
+                    //ERROR HANDLING
                     perror("connect failed!");
                     _exit(EXIT_FAILURE);
                 }
                 //final part once socket is setup and connected
                 if (dup2(sockfd, STDOUT_FILENO) == -1){
+                    //ERROR HANDLING
                     perror("dup2");
                     _exit(EXIT_FAILURE);
                 }
@@ -325,8 +336,7 @@ int main(int argc, char *argv[]){
                 fprintf(stderr, "no inputs longer than %d characters\n", MAX_INPUT_LENGTH);
                 // discard the rest of the line
                 int c;
-                while ((c = getchar()) != '\n' && c != EOF){
-                }
+                while ((c = getchar()) != '\n' && c != EOF);
                 continue;
             }
             input[strcspn(input, "\n")] = '\0'; // replace newline with null terminator
@@ -365,8 +375,7 @@ int main(int argc, char *argv[]){
                 fprintf(stderr, "no inputs longer than %d characters\n", MAX_INPUT_LENGTH);
                 // discard the rest of the line
                 int c;
-                while ((c = fgetc(batch)) != '\n' && c != EOF){
-                }
+                while ((c = fgetc(batch)) != '\n' && c != EOF);
                 continue;
             }
             input[strcspn(input, "\n")] = '\0'; // replace newline with null terminator

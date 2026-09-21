@@ -45,6 +45,7 @@ explain any known errors or limiations to the code
 - on the current autograder submission shims score 0/0 despite appearing to create and populate a clemshlog.txt file
 - I think my error handling is pretty robust but it consisitently fails the autograder
 - my error handling strat is to just check every system or lib call and attatch a stderr message to it if its a point of failure. 
+- I not sure what to do about ctrl-c as mentioned in the document. I feel like ctrl-c should quit the program
 
 
 ## DESIGN
