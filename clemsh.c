@@ -60,7 +60,7 @@ int execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
     struct timespec start_times[pipeline->command_count]; // array representing the start time of each command 
     for (size_t i = 0; i < pipeline->command_count; i++){
         // create pipe if we are not last command | avoids unecessary pipe
-        if ( i < pipeline->command_count - 1 && pipe(pipe_fd) == -1){
+        if (i < pipeline->command_count - 1 && pipe(pipe_fd) == -1){
             perror("pipe");
             close(prev_fd);
             pipeline_failed = 1;
@@ -299,6 +299,7 @@ int execute_pipeline(Pipeline *pipeline, FILE *log, int pipeline_number){
                     fflush(log);
                 }
             }
+            fprintf(stderr, "command %zu in pipeline %d terminated by %d \n", i, pipeline_number, WTERMSIG(state));
         }
     }
     return pipeline_failed;

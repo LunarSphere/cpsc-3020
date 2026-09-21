@@ -39,11 +39,24 @@ char *getenv(const char *name){
 int setenv(const char *name, const char *value, int overwrite){
     //call real set env using dlsym
     int (*original_setenv)(const char *, const char *, int) = dlsym(RTLD_NEXT, "setenv");
+    char *(*original_getenv)(const char *) = dlsym(RTLD_NEXT, "getenv");
+    char *prev_value = original_getenv(name); // see if variable was previously set
     int result = original_setenv(name, value, overwrite); 
 
     //log helper
-    // split based on equal sign to get name and value
-    log_event("ENVWRITE", value, name);
+    //if variable is not set and overwrite == 0 log it
+    
+    if (prev_value == NULL && overwrite == 0){
+        log_event("ENVWRITE", "", name);
+    }
+    // if overwrite is not 0 log it
+    
+    else if (overwrite != 0){
+        log_event("ENVWRITE", value, name);
+    }
+    // variable is set and overwrite == 0 dont log it
+    else if (prev_value != NULL && overwrite == 0){return result;}
+    
     //return result of setenv
     return result;
 }
