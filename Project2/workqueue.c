@@ -34,7 +34,7 @@ struct wq{
     pthread_mutex_t lock; // bundle sync logic and task data
     pthread_cond_t not_empty; // signal workers that their is work in queue
     pthread_cond_t not_full; // tell submitter their is space to submit tasks
-    // pthread_cond_t done; // tell wq that the task is done
+    pthread_cond_t done; // tell wq that the task is done
     int shutdown;
 };
 
@@ -75,14 +75,6 @@ static w_task dequeue(struct wq *q){
     return task;
 }
 
-// try to handle wait with a spin lock 
-bool is_task_done(struct wq *q, wq_job_id_t task_id){
-    pthread_mutex_lock(&q->lock);
-    bool done = (q->tasks[task_id].state == DONE);
-    pthread_mutex_unlock(&q->lock);
-    return done;
-}
-
 
 //start routine for the thread
 // image a thread spawns and just starts following its daily routine.  
@@ -112,14 +104,19 @@ static void *tfn(void *arg){
         pthread_cond_signal(&q->not_full);
         pthread_mutex_unlock(&q->lock);
         // execute tasks function with its args
+        wq_job_id_t completed_task_id = task.id;
         task.fn(task.arg);
         //mark the task as done
         pthread_mutex_lock(&q->lock);
-        task.state = DONE;
+        q->tasks[completed_task_id % q->queue_capacity].state = DONE;
+        pthread_cond_signal(&q->done);
         pthread_mutex_unlock(&q->lock);
-
     }
     return NULL;
+}
+
+static bool is_task_done(struct wq *q, wq_job_id_t task_id){
+    return (q->tasks[task_id % q->queue_capacity].state == DONE);
 }
 
 // initialize a queue and worker threads (threadpool)
@@ -135,7 +132,7 @@ wq_t *wq_create(size_t num_workers, size_t queue_capacity){
     pthread_mutex_init(&q->lock, NULL);
     pthread_cond_init(&q->not_empty, NULL);
     pthread_cond_init(&q->not_full, NULL);
-    // pthread_cond_init(&q->done, NULL);
+    pthread_cond_init(&q->done, NULL);
     for (size_t task_id = 0; task_id < num_workers; task_id++){
         pthread_create(&q->threads[task_id], NULL, tfn, (void *)q); //takes thread id, attributes, function, and the queue as an argument to the function
     }
@@ -186,7 +183,11 @@ void wq_wait(wq_t *q, wq_job_id_t *ids, int numids){
     for (int i = 0; i < numids; i++){
         task_id = ids[i] % q->queue_capacity;
         // do nothing until state is done
-        while ( !is_task_done(q, task_id) && !q->shutdown){}
+        pthread_mutex_lock(&q->lock);
+        while (!is_task_done(q, task_id) && !q->shutdown){
+            pthread_cond_wait(&q->done, &q->lock);
+        }
+        pthread_mutex_unlock(&q->lock);
         pthread_cond_signal(&q->not_empty);
     }
 }
@@ -208,7 +209,7 @@ void wq_shutdown(wq_t *q){
     pthread_mutex_destroy(&q->lock);
     pthread_cond_destroy(&q->not_empty);
     pthread_cond_destroy(&q->not_full);
-    // pthread_cond_destroy(&q->done);
+    pthread_cond_destroy(&q->done);
     free(q->threads);
     free(q->tasks);
     free(q);
