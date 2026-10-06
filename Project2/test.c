@@ -100,5 +100,7 @@ int main(int argc, char **argv)
         FAIL("No tasks were executed.");
     }
 
+    wq_shutdown(myworkqueue);
+
     return EXIT_SUCCESS;
 }

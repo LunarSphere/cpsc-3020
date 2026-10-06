@@ -3,19 +3,18 @@ Student: Kevius Tribble
 Instructor: Dr. Jacob Sorber
 CPSC 3020
 10/9/2025
-Implementation of a work queue with a thread pool. 
+Implementation of a simple workqueue library. create threadsafe tasks to be executed concurrently by a thread pool.
 */
 
 #include "workqueue.h"
-#include <unistd.h>
 #include <stdio.h>
 #include <pthread.h>
 #include <stdbool.h>
 
+
 // track state of a queued task 
 typedef enum{
     SUBMITTED,
-    IN_PROG,
     DONE
 }task_state;
 
@@ -24,7 +23,6 @@ typedef struct w_task{
     wq_job_id_t id;
     wq_job_fn fn;
     void *arg;
-    task_state state;
 }w_task;
 
 /*
@@ -36,11 +34,11 @@ typedef struct w_task{
 struct wq{
     size_t queue_capacity;
     size_t num_workers;
-    size_t count;
     int front;
     int rear;
     pthread_t *threads;
     w_task *tasks;
+    task_state *task_states;
     wq_job_id_t next_task_id;
     pthread_mutex_t lock; // so we can lock the queue when we are enqueuing or dequeuing tasks
     pthread_cond_t not_empty; // signal workers that their is work in queue
@@ -51,18 +49,17 @@ struct wq{
 
 //make an empty queue
 static void initQueue(struct wq *q){
-    q->front = 0;
+    q->front = -1;
     q->rear = 0;
-    q->count = 0;
 }
 
 //is queue empty
 static bool is_wq_empty(struct wq *q){
-    return (q->count == 0);
+    return (q->front == q->rear - 1);
 }
 //is queue full
 static bool is_wq_full(struct wq *q){
-    return (q->count == q->queue_capacity);
+    return (q->rear == q->queue_capacity);
 }
 //add an item to the queue
 static void enqueue(struct wq *q, w_task task){
@@ -71,19 +68,18 @@ static void enqueue(struct wq *q, w_task task){
         return;
     }
     q->tasks[q->rear] = task;
-    q->rear = (q->rear + 1) % q-> queue_capacity;
-    q->count++;
+    q->rear++;
 }
 //remove an item from the queue
 static w_task dequeue(struct wq *q){
-    w_task task = {0, NULL, NULL, IN_PROG};
+    q->front++;
+    w_task task = {0, NULL, NULL};
+    task = q->tasks[q->front];
+    // reset queue if it is empty after dequeueing a task 
     if (is_wq_empty(q)){
-        fprintf(stderr, "queue is empty\n");
+        initQueue(q);
         return task;
     }
-    task = q->tasks[q->front];
-    q->front = (q->front + 1) % q->queue_capacity;
-    q->count--;
     return task;
 }
 
@@ -105,7 +101,7 @@ static void *tfn(void *arg){
             pthread_cond_wait(&q->not_empty, &q->lock); 
         }
         // if shut down signal signal not empty, unlock queue, wake up other workers so they can exit
-        if (q->shutdown){
+        if (q->shutdown && is_wq_empty(q)){
             pthread_cond_signal(&q->not_empty);
             pthread_mutex_unlock(&q->lock);
             break;
@@ -121,7 +117,7 @@ static void *tfn(void *arg){
         task.fn(task.arg);
         //mark the task as done | critical section make sure other threads cant edit this
         pthread_mutex_lock(&q->lock);
-        q->tasks[completed_task_id % q->queue_capacity].state = DONE;
+        q->task_states[completed_task_id % q->queue_capacity] = DONE;
         pthread_cond_signal(&q->done);
         pthread_mutex_unlock(&q->lock);
     }
@@ -134,6 +130,7 @@ wq_t *wq_create(size_t num_workers, size_t queue_capacity){
     initQueue(q);
     q->queue_capacity = queue_capacity;
     q->num_workers = num_workers;
+    q->task_states = calloc(queue_capacity, sizeof(task_state));
     q->tasks = calloc(queue_capacity, sizeof(w_task));
     q->threads = calloc(num_workers, sizeof(pthread_t));
     q->next_task_id = 1;
@@ -177,7 +174,7 @@ wq_job_id_t wq_submit(wq_t *q, wq_job_fn fn, void *arg){
     submitted_task.id = q->next_task_id;
     submitted_task.fn = fn;
     submitted_task.arg = arg;
-    submitted_task.state = SUBMITTED;
+    q->task_states[submitted_task.id % q->queue_capacity] = SUBMITTED;
     enqueue(q, submitted_task);
     pthread_cond_signal(&q->not_empty);
     pthread_mutex_unlock(&q->lock);    
@@ -196,7 +193,7 @@ void wq_wait(wq_t *q, wq_job_id_t *ids, int numids){
         task_id = ids[i] % q->queue_capacity;
         // do nothing until state is done
         pthread_mutex_lock(&q->lock);
-        while (!(q->tasks[task_id].state == DONE) && !q->shutdown){
+        while (!(q->task_states[task_id] == DONE) && !q->shutdown){
             pthread_cond_wait(&q->done, &q->lock); // sleep until done is signaled
         }
         pthread_mutex_unlock(&q->lock);
@@ -206,9 +203,8 @@ void wq_wait(wq_t *q, wq_job_id_t *ids, int numids){
 
 // frees everything created by the queue and waits joins the last 
 void wq_shutdown(wq_t *q){
-    // free thread pool
-    // free worker queue
     pthread_mutex_lock(&q->lock);
+    // graceful shutdown
     q->shutdown = 1;
     pthread_cond_signal(&q->not_empty);
     pthread_cond_signal(&q->not_full);
@@ -217,10 +213,13 @@ void wq_shutdown(wq_t *q){
     for (size_t i = 0; i < q->num_workers; i++){
         pthread_join(q->threads[i], NULL);
     }
+    // free pthread inits
     pthread_mutex_destroy(&q->lock);
     pthread_cond_destroy(&q->not_empty);
     pthread_cond_destroy(&q->not_full);
     pthread_cond_destroy(&q->done);
+    // Free Callocs
+    free(q->task_states);
     free(q->threads);
     free(q->tasks);
     free(q);

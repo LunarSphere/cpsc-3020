@@ -28,10 +28,18 @@ gcc -o test  test.c libworkqueue.a
 
 ## KNOWN PROBLEMS
 
-As of the 10/5/25 Submission their are no known issues with project 2. lets see if the compiler says otherwise.
+- no known problems as of 10/6/26
+
 
 ## DESIGN
 
+Files
 workqueue.h -> header for libworkqueue.c comtaining important type definitions and function signatures
 workqueue.c -> implementation of a workqueue & Thread pool
 makefile -> makes code compilation ez
+
+Design Choices
+
+- Decided to use pthread_cond_init, and pthread_cond_destroy because i thought was most intuitive for them to be part of the queue struct
+  becuase they are part of our queue which is dynamically allocated the static method we learned in class would throw a compiler error.
+  init just makes the condition variable valid for use | [www.ibm.com/docs/en/zos/3.1.0?topic=functions-pthread-cond-init-initialize-condition-variable](https://www.ibm.com/docs/en/zos/3.1.0?topic=functions-pthread-cond-init-initialize-condition-variable)
