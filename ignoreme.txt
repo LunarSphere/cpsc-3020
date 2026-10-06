@@ -1,2 +1,4 @@
 gcc -o test  test.c libworkqueue.a
 ./test
+
+ar is short for archive and it basically tars .o files into a library
