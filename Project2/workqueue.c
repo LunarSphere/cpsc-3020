@@ -1,9 +1,18 @@
+/*
+Student: Kevius Tribble
+Instructor: Dr. Jacob Sorber
+CPSC 3020
+10/9/2025
+Implementation of a work queue with a thread pool. 
+*/
+
 #include "workqueue.h"
 #include <unistd.h>
 #include <stdio.h>
 #include <pthread.h>
 #include <stdbool.h>
 
+// track state of a queued task 
 typedef enum{
     SUBMITTED,
     IN_PROG,
@@ -22,6 +31,8 @@ typedef struct w_task{
 * A work queue holds tasks that will be exeucted by a thread pool 
 * This Queue is circular 
 */
+
+//little note: conditionals > spinlocks because spinlocks(busy wait) burns a cpu core doing nothing
 struct wq{
     size_t queue_capacity;
     size_t num_workers;
@@ -31,10 +42,10 @@ struct wq{
     pthread_t *threads;
     w_task *tasks;
     wq_job_id_t next_task_id;
-    pthread_mutex_t lock; // bundle sync logic and task data
+    pthread_mutex_t lock; // so we can lock the queue when we are enqueuing or dequeuing tasks
     pthread_cond_t not_empty; // signal workers that their is work in queue
     pthread_cond_t not_full; // tell submitter their is space to submit tasks
-    pthread_cond_t done; // tell wq that the task is done
+    pthread_cond_t done; // tell thread pool that task is done
     int shutdown;
 };
 
@@ -44,6 +55,7 @@ static void initQueue(struct wq *q){
     q->rear = 0;
     q->count = 0;
 }
+
 //is queue empty
 static bool is_wq_empty(struct wq *q){
     return (q->count == 0);
@@ -77,21 +89,22 @@ static w_task dequeue(struct wq *q){
 
 
 //start routine for the thread
-// image a thread spawns and just starts following its daily routine.  
-// threads never terminate until shutdown is set. so join takes fover
-// wait is waiting for task ids not thread ids. 
-// come up with a way to keep track with if a task is still in progress. 
-// track states: task could still be in, worker thread could be working on it. or it could be finished. 
+// imagine a thread spawns and just starts following its daily routine. 
+/*
+* takes void ptr | so thread join has a ** ptr and tfn has a * this is useful for if we want the thread
+* to change something permanently
+*/ 
 static void *tfn(void *arg){
     struct wq *q = (struct wq *)arg; 
     while (true){
-        // lock the queue
+        // lock the queue 
         pthread_mutex_lock(&q->lock);
-        // while the queue is empty and not shutdown we wait for a task to be added
+        // while queue is empty and not shutdown
         while (is_wq_empty(q) && !q->shutdown){
-            pthread_cond_wait(&q->not_empty, &q->lock);
+            //release the lock, sleep until not empty is signaled, reacquire lock
+            pthread_cond_wait(&q->not_empty, &q->lock); 
         }
-        // if shut down signal signal not empty, unlock queue, signal not empty, and break
+        // if shut down signal signal not empty, unlock queue, wake up other workers so they can exit
         if (q->shutdown){
             pthread_cond_signal(&q->not_empty);
             pthread_mutex_unlock(&q->lock);
@@ -106,17 +119,13 @@ static void *tfn(void *arg){
         // execute tasks function with its args
         wq_job_id_t completed_task_id = task.id;
         task.fn(task.arg);
-        //mark the task as done
+        //mark the task as done | critical section make sure other threads cant edit this
         pthread_mutex_lock(&q->lock);
         q->tasks[completed_task_id % q->queue_capacity].state = DONE;
         pthread_cond_signal(&q->done);
         pthread_mutex_unlock(&q->lock);
     }
     return NULL;
-}
-
-static bool is_task_done(struct wq *q, wq_job_id_t task_id){
-    return (q->tasks[task_id % q->queue_capacity].state == DONE);
 }
 
 // initialize a queue and worker threads (threadpool)
@@ -134,28 +143,31 @@ wq_t *wq_create(size_t num_workers, size_t queue_capacity){
     pthread_cond_init(&q->not_full, NULL);
     pthread_cond_init(&q->done, NULL);
     for (size_t task_id = 0; task_id < num_workers; task_id++){
-        pthread_create(&q->threads[task_id], NULL, tfn, (void *)q); //takes thread id, attributes, function, and the queue as an argument to the function
+        //takes thread ids, attributes, function, and the queue as an argument to the function
+        pthread_create(&q->threads[task_id], NULL, tfn, (void *)q); 
     }
     return q;
 }
 
 
-// submit a work task to the work queue, and wait for an availible worker thread to complete it. 
-// task ids should be unique positive integers
+/*
+* takes queue, jobfn and arguments for jobfn
+* submits job to the queue for execution
+*/
 wq_job_id_t wq_submit(wq_t *q, wq_job_fn fn, void *arg){
     // a task consists of a pointer to a function of type wq_job_fn and a void* arguement. 
-    // indicate errors by returning a -1. 
+    // indicate errors by returning a -1 | queue is empty no function provided
     if (!q || !fn){
         return -1;
     }
     //while the queue is full we wait
     pthread_mutex_lock(&q->lock);
     while (is_wq_full(q) && !q->shutdown){
-        pthread_cond_wait(&q->not_full, &q->lock); // lock submission until q is not full
+        pthread_cond_wait(&q->not_full, &q->lock); // wait until queue isnt full to submit
     }
     // abandon submitted task
     if (q->shutdown){
-        pthread_cond_signal(&q->not_empty);
+        pthread_cond_signal(&q->not_empty); 
         pthread_mutex_unlock(&q->lock);
         return -1;
     }
@@ -184,16 +196,15 @@ void wq_wait(wq_t *q, wq_job_id_t *ids, int numids){
         task_id = ids[i] % q->queue_capacity;
         // do nothing until state is done
         pthread_mutex_lock(&q->lock);
-        while (!is_task_done(q, task_id) && !q->shutdown){
-            pthread_cond_wait(&q->done, &q->lock);
+        while (!(q->tasks[task_id].state == DONE) && !q->shutdown){
+            pthread_cond_wait(&q->done, &q->lock); // sleep until done is signaled
         }
         pthread_mutex_unlock(&q->lock);
         pthread_cond_signal(&q->not_empty);
     }
 }
 
-// when called all worker threads complete their task and exit, abandon any tasks remaining on queue
-// free any allocated memory for queue and thread pool
+// frees everything created by the queue and waits joins the last 
 void wq_shutdown(wq_t *q){
     // free thread pool
     // free worker queue
@@ -202,7 +213,7 @@ void wq_shutdown(wq_t *q){
     pthread_cond_signal(&q->not_empty);
     pthread_cond_signal(&q->not_full);
     pthread_mutex_unlock(&q->lock);
-    //maybe a join so workers can finish their tasks before we free the memory
+    //suspend main thread until thread in thread pool finishes| wait for workers to finish executing tasks
     for (size_t i = 0; i < q->num_workers; i++){
         pthread_join(q->threads[i], NULL);
     }
