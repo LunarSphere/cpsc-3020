@@ -144,7 +144,7 @@ wq_t *wq_create(size_t num_workers, size_t queue_capacity){
     pthread_cond_init(&q->not_empty, NULL);
     pthread_cond_init(&q->not_full, NULL);
     pthread_cond_init(&q->done, NULL);
-    for (size_t task_id = 0; task_id < num_workers; task_id++){
+    for (int task_id = 0; task_id < num_workers; task_id++){
         //takes thread ids, attributes, function, and the queue as an argument to the function
         pthread_create(&q->threads[task_id], NULL, tfn, q); 
     }
@@ -169,8 +169,8 @@ wq_job_id_t wq_submit(wq_t *q, wq_job_fn fn, void *arg){
     }
     // once task is added the function assgins the task an id and returns the id back to the calling function
     w_task submitted_task;
-    q->next_task_id++;
     submitted_task.id = q->next_task_id;
+    q->next_task_id++;
     submitted_task.fn = fn;
     submitted_task.arg = arg;
     q->task_states[submitted_task.id] = SUBMITTED;
@@ -209,7 +209,7 @@ void wq_shutdown(wq_t *q){
     pthread_cond_signal(&q->not_full);
     pthread_mutex_unlock(&q->lock);
     //suspend main thread until thread in thread pool finishes| wait for workers to finish executing tasks
-    for (size_t i = 0; i < q->num_workers; i++){
+    for (int i = 0; i < q->num_workers; i++){
         pthread_join(q->threads[i], NULL);
     }
     // free pthread inits
