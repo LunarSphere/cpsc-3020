@@ -11,6 +11,7 @@ Implementation of a simple workqueue library. create threadsafe tasks to be exec
 #include <pthread.h>
 #include <stdbool.h>
 
+#define MAX_TASKS 9999
 
 // track state of a queued task 
 typedef enum{
@@ -26,10 +27,8 @@ typedef struct w_task{
 }w_task;
 
 /*
-* A work queue holds tasks that will be exeucted by a thread pool 
-* This Queue is circular 
+* A circular queue of tasks to be executed by a thread pool. 
 */
-
 //little note: conditionals > spinlocks because spinlocks(busy wait) burns a cpu core doing nothing
 struct wq{
     size_t queue_capacity;
@@ -50,16 +49,16 @@ struct wq{
 //make an empty queue
 static void initQueue(struct wq *q){
     q->front = -1;
-    q->rear = 0;
+    q->rear = -1;
 }
 
 //is queue empty
 static bool is_wq_empty(struct wq *q){
-    return (q->front == q->rear - 1);
+    return (q->front == -1);
 }
 //is queue full
 static bool is_wq_full(struct wq *q){
-    return (q->rear == q->queue_capacity);
+    return ((q->rear + 1) % q->queue_capacity == q->front);
 }
 //add an item to the queue
 static void enqueue(struct wq *q, w_task task){
@@ -67,18 +66,24 @@ static void enqueue(struct wq *q, w_task task){
         fprintf(stderr, "queue is full\n");
         return;
     }
+    if (is_wq_empty(q)){
+        q->front = 0;
+    }
+    q->rear = (q->rear + 1) % q->queue_capacity;
     q->tasks[q->rear] = task;
-    q->rear++;
 }
 //remove an item from the queue
 static w_task dequeue(struct wq *q){
-    q->front++;
-    w_task task = {0, NULL, NULL};
-    task = q->tasks[q->front];
-    // reset queue if it is empty after dequeueing a task 
     if (is_wq_empty(q)){
+        w_task empty_task = {0, NULL, NULL};
+        return empty_task;
+    }
+    
+    w_task task = q->tasks[q->front];
+    if (q->front == q->rear){
         initQueue(q);
-        return task;
+    } else {
+        q->front = (q->front + 1) % q->queue_capacity;
     }
     return task;
 }
@@ -91,7 +96,7 @@ static w_task dequeue(struct wq *q){
 * to change something permanently
 */ 
 static void *tfn(void *arg){
-    struct wq *q = (struct wq *)arg; 
+    struct wq *q = arg; 
     while (true){
         // lock the queue 
         pthread_mutex_lock(&q->lock);
@@ -100,8 +105,8 @@ static void *tfn(void *arg){
             //release the lock, sleep until not empty is signaled, reacquire lock
             pthread_cond_wait(&q->not_empty, &q->lock); 
         }
-        // if shut down signal signal not empty, unlock queue, wake up other workers so they can exit
-        if (q->shutdown && is_wq_empty(q)){
+        // if shut down signal signal not empty, unlock, wake up other workers so they can exit
+        if (q->shutdown){
             pthread_cond_signal(&q->not_empty);
             pthread_mutex_unlock(&q->lock);
             break;
@@ -117,7 +122,7 @@ static void *tfn(void *arg){
         task.fn(task.arg);
         //mark the task as done | critical section make sure other threads cant edit this
         pthread_mutex_lock(&q->lock);
-        q->task_states[completed_task_id % q->queue_capacity] = DONE;
+        q->task_states[completed_task_id] = DONE; // this will index 
         pthread_cond_signal(&q->done);
         pthread_mutex_unlock(&q->lock);
     }
@@ -130,7 +135,7 @@ wq_t *wq_create(size_t num_workers, size_t queue_capacity){
     initQueue(q);
     q->queue_capacity = queue_capacity;
     q->num_workers = num_workers;
-    q->task_states = calloc(queue_capacity, sizeof(task_state));
+    q->task_states = calloc(MAX_TASKS, sizeof(task_state));
     q->tasks = calloc(queue_capacity, sizeof(w_task));
     q->threads = calloc(num_workers, sizeof(pthread_t));
     q->next_task_id = 1;
@@ -141,7 +146,7 @@ wq_t *wq_create(size_t num_workers, size_t queue_capacity){
     pthread_cond_init(&q->done, NULL);
     for (size_t task_id = 0; task_id < num_workers; task_id++){
         //takes thread ids, attributes, function, and the queue as an argument to the function
-        pthread_create(&q->threads[task_id], NULL, tfn, (void *)q); 
+        pthread_create(&q->threads[task_id], NULL, tfn, q); 
     }
     return q;
 }
@@ -157,24 +162,18 @@ wq_job_id_t wq_submit(wq_t *q, wq_job_fn fn, void *arg){
     if (!q || !fn){
         return -1;
     }
-    //while the queue is full we wait
+    //wait for threads to finish queued tasks then submit a new task
     pthread_mutex_lock(&q->lock);
     while (is_wq_full(q) && !q->shutdown){
-        pthread_cond_wait(&q->not_full, &q->lock); // wait until queue isnt full to submit
-    }
-    // abandon submitted task
-    if (q->shutdown){
-        pthread_cond_signal(&q->not_empty); 
-        pthread_mutex_unlock(&q->lock);
-        return -1;
+        pthread_cond_wait(&q->not_full, &q->lock); 
     }
     // once task is added the function assgins the task an id and returns the id back to the calling function
     w_task submitted_task;
-    q->next_task_id ++;
+    q->next_task_id++;
     submitted_task.id = q->next_task_id;
     submitted_task.fn = fn;
     submitted_task.arg = arg;
-    q->task_states[submitted_task.id % q->queue_capacity] = SUBMITTED;
+    q->task_states[submitted_task.id] = SUBMITTED;
     enqueue(q, submitted_task);
     pthread_cond_signal(&q->not_empty);
     pthread_mutex_unlock(&q->lock);    
@@ -190,22 +189,22 @@ void wq_wait(wq_t *q, wq_job_id_t *ids, int numids){
     // waits until they all execute
     wq_job_id_t task_id;
     for (int i = 0; i < numids; i++){
-        task_id = ids[i] % q->queue_capacity;
+        task_id = ids[i];
         // do nothing until state is done
         pthread_mutex_lock(&q->lock);
         while (!(q->task_states[task_id] == DONE) && !q->shutdown){
             pthread_cond_wait(&q->done, &q->lock); // sleep until done is signaled
         }
         pthread_mutex_unlock(&q->lock);
-        pthread_cond_signal(&q->not_empty);
     }
 }
 
-// frees everything created by the queue and waits joins the last 
+// frees everything created by the queue and joins the threads
 void wq_shutdown(wq_t *q){
     pthread_mutex_lock(&q->lock);
-    // graceful shutdown
+    //shutdown
     q->shutdown = 1;
+    pthread_cond_signal(&q->done);
     pthread_cond_signal(&q->not_empty);
     pthread_cond_signal(&q->not_full);
     pthread_mutex_unlock(&q->lock);

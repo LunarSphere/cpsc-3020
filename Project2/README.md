@@ -28,8 +28,7 @@ gcc -o test  test.c libworkqueue.a
 
 ## KNOWN PROBLEMS
 
-- no known problems as of 10/6/26
-
+- A work queue can have 9999 tasks submitted over its lifetime.
 
 ## DESIGN
 
