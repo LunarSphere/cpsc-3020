@@ -1,18 +1,81 @@
 #include "cat16.h"
+#include <stdio.h>
+#include <errno.h>
+
+
+struct cat16_volume{
+    long image_size;
+    uint16_t sector_size; // 2 byte int
+    uint8_t sectors_per_cluster; // 1 byte int
+    uint16_t sectors_per_fat;
+    uint8_t number_fats;
+    uint16_t total_sectors;
+    unsigned char *image_buffer;
+};
+
 
 /*
  * cat16_mount -- load's a FAT16 disk image into memory.
  * Return:
  *   - NULL: on failure if the image could not be
  *      mounted --- file not found, image doesn't follow
- *      the expected format (too small, corrupted boot
- *      sector, does not use the right geometry).
+ *      the expected format (image size = 4mb, sectorsize = 512,
+ *      sectors per cluster = 1, sectors per fat = 32, number of FATs = 2
+ *      total_sectors = 0x2000).
  *   - Pointer to an opaque struct representing the mounted
  *      disk image. You can store whatever you need to store
  *      in this struct.
  */
 cat16_volume_t *cat16_mount(const char *image_path){
-    return NULL;
+    cat16_volume_t *volume = (cat16_volume_t *)malloc(sizeof(cat16_volume_t));
+    FILE *file = fopen(image_path, "rb");
+    // image could not be mounted
+    if (file == NULL) {
+        free(volume);
+        return NULL;
+    }
+    // determine the size of the image 
+    fseek(file, 0, SEEK_END);
+    volume->image_size = ftell(file); // current possiton of pointer in the stream. since we are at the end of the file, this will give us the size of the filev
+    rewind(file); // move back to start of file
+    // allocate memory for the exact size of the image
+    unsigned char * image_buffer = (unsigned char *)malloc(volume->image_size);
+    // image could not be mouunted
+    if (image_buffer == NULL) {
+        fclose(file);
+        return NULL;
+    }
+    // read the disk image into the buffer
+    size_t bytes_read = fread(image_buffer, 1, volume->image_size, file);
+    if (bytes_read != volume->image_size) {
+        free(image_buffer);
+        fclose(file);
+        return NULL;
+    }
+    // store the image buffer in the volume struct
+    volume->image_buffer = image_buffer;
+    // fseek moves file pointer to specified position in the file. 
+    // SEEK_SET goes to the absolute position in the file. 
+    // fread (where to store data, size of the data, number of times to read data, where its stored)
+    // jump around to fill in the struct with the correct values
+    fseek(file, 11, SEEK_SET);
+    fread(&volume->sector_size, sizeof(volume->sector_size), 1, file);
+    fseek(file, 13, SEEK_SET);
+    fread(&volume->sectors_per_cluster, sizeof(volume->sectors_per_cluster), 1, file);
+    fseek(file, 22, SEEK_SET);
+    fread(&volume->sectors_per_fat, sizeof(volume->sectors_per_fat), 1, file);
+    fseek(file, 16, SEEK_SET);
+    fread(&volume->number_fats, sizeof(volume->number_fats), 1, file);
+    fseek(file, 19, SEEK_SET);
+    fread(&volume->total_sectors, sizeof(volume->total_sectors), 1, file);
+    fclose(file);
+    // check that the image meets the expected format
+    if (volume->image_size != 0x400000 || volume->sector_size != 512 || volume->sectors_per_cluster != 1 || volume->sectors_per_fat != 32 || volume->number_fats != 2 || volume->total_sectors != 0x2000) {
+        free(image_buffer);
+        free(volume);
+        return NULL;
+    }
+    return volume;
 }
 
 /*
@@ -30,6 +93,11 @@ cat16_volume_t *cat16_mount(const char *image_path){
  *      error message should be used for EINVAL.
  */
 int cat16_unmount(cat16_volume_t *volume){
+    if (volume == NULL) {
+        return -EINVAL;
+    }
+    free(volume->image_buffer);
+    free(volume);
     return 0;
 }
 
