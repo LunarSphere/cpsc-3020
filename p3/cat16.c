@@ -1,6 +1,21 @@
 #include "cat16.h"
 #include <stdio.h>
 #include <errno.h>
+#include <string.h>
+#include <stdbool.h>
+
+#define filename_bytes 8
+#define extension_bytes 3
+#define FOUR_MB 0x400000
+#define ROOT_DIR_START_SECTOR 65 // 65*512
+#define ROOT_DIR_END_SECTOR 97 // 97*512
+#define SECTOR_SIZE 512
+#define SECTORS_PER_CLUSTER 1
+#define SECTORS_PER_FAT 32
+#define TOTAL_SECTORS 0x2000
+#define path_depth 99
+#define max_path_length 9999
+#define ENTRY_SIZE 32
 
 
 struct cat16_volume{
@@ -10,8 +25,27 @@ struct cat16_volume{
     uint16_t sectors_per_fat;
     uint8_t number_fats;
     uint16_t total_sectors;
-    unsigned char *image_buffer;
+    FILE *image_buffer;
+    int last_error_code; 
 };
+
+struct cat16_dir_entry{
+    char filename[filename_bytes]; 
+    char extension[extension_bytes];
+    uint8_t attributes;
+    uint16_t reserved;
+    uint16_t create_time;
+    uint16_t create_date;
+    uint16_t last_access_date;
+    uint16_t hidden_bytes; // in the table there is a mysterious extra 2 bytes between these two fields
+    uint16_t last_write_time;
+    uint16_t last_write_date;
+    uint16_t first_logical_cluster;
+    uint32_t file_size;
+    int byte_offset; // entries location in the image buffer
+    int entry_found; // 1 if found 0 if not found
+};
+
 
 
 /*
@@ -27,36 +61,22 @@ struct cat16_volume{
  *      in this struct.
  */
 cat16_volume_t *cat16_mount(const char *image_path){
-    cat16_volume_t *volume = (cat16_volume_t *)malloc(sizeof(cat16_volume_t));
+    cat16_volume_t *volume = malloc(sizeof(cat16_volume_t));
     FILE *file = fopen(image_path, "rb");
-    // image could not be mounted
-    if (file == NULL) {
+    // image could not be mounted | no such file or directory
+    if (file == NULL){
+        volume->last_error_code = ENOENT;
         free(volume);
         return NULL;
     }
     // determine the size of the image 
     fseek(file, 0, SEEK_END);
     volume->image_size = ftell(file); // current possiton of pointer in the stream. since we are at the end of the file, this will give us the size of the filev
-    rewind(file); // move back to start of file
-    // allocate memory for the exact size of the image
-    unsigned char * image_buffer = (unsigned char *)malloc(volume->image_size);
-    // image could not be mouunted
-    if (image_buffer == NULL) {
-        fclose(file);
-        return NULL;
-    }
-    // read the disk image into the buffer
-    size_t bytes_read = fread(image_buffer, 1, volume->image_size, file);
-    if (bytes_read != volume->image_size) {
-        free(image_buffer);
-        fclose(file);
-        return NULL;
-    }
     // store the image buffer in the volume struct
-    volume->image_buffer = image_buffer;
+    volume->image_buffer = file;
     // fseek moves file pointer to specified position in the file. 
     // SEEK_SET goes to the absolute position in the file. 
-    // fread (where to store data, size of the data, number of times to read data, where its stored)
+    // fread (where to store data, size of the data, number of times to read data, where its stored) | reads raw bytes data from a file and sends to a buffer. 
     // jump around to fill in the struct with the correct values
     fseek(file, 11, SEEK_SET);
     fread(&volume->sector_size, sizeof(volume->sector_size), 1, file);
@@ -68,10 +88,9 @@ cat16_volume_t *cat16_mount(const char *image_path){
     fread(&volume->number_fats, sizeof(volume->number_fats), 1, file);
     fseek(file, 19, SEEK_SET);
     fread(&volume->total_sectors, sizeof(volume->total_sectors), 1, file);
-    fclose(file);
     // check that the image meets the expected format
-    if (volume->image_size != 0x400000 || volume->sector_size != 512 || volume->sectors_per_cluster != 1 || volume->sectors_per_fat != 32 || volume->number_fats != 2 || volume->total_sectors != 0x2000) {
-        free(image_buffer);
+    if (volume->image_size != FOUR_MB || volume->sector_size != SECTOR_SIZE || volume->sectors_per_cluster != SECTORS_PER_CLUSTER || volume->sectors_per_fat != SECTORS_PER_FAT || volume->number_fats != 2 || volume->total_sectors != TOTAL_SECTORS){
+        fclose(file);
         free(volume);
         return NULL;
     }
@@ -93,39 +112,114 @@ cat16_volume_t *cat16_mount(const char *image_path){
  *      error message should be used for EINVAL.
  */
 int cat16_unmount(cat16_volume_t *volume){
-    if (volume == NULL) {
+    // invaild argument
+    if (volume == NULL){
         return -EINVAL;
     }
-    free(volume->image_buffer);
+    fclose(volume->image_buffer);
     free(volume);
     return 0;
 }
 
-/*
- * cat16_writefile -- write a file with the specified name
- *      (path) to the mounted volume. If successful, the
- *      newly created file should have the length
- *      (bytes_to_write) and content (filedata) specified.
- *      If a file with that name already exists, it should be
- *      overwritten, and the old file data removed.
- * Return:
- *  - 0 (zero) on success.
- *  - On failures, it should return a negative error code.
- *      I should be able to pass this error code into the
- *      cat16_strerror() function, in order to get the
- *      corresponding error message. The standard system
- *      error message should be used for ENOSPC, EINVAL,
- *      ENAMETOOLONG, ENOENT, and ENOTDIR.
- */
-int cat16_writefile(cat16_volume_t *volume, const char *path, uint8_t *filedata, size_t bytes_to_write){
-    return 0;
+// search directory for a file or directory with the specified filename.
+// returns a struct representing the directory entry if found, else empty entry with entry_found = 0 
+cat16_dir_entry_t search_directory(cat16_volume_t *volume, const char *filename, int start_sector, int end_sector){
+    cat16_dir_entry_t entry;
+    entry.entry_found = 0; // initialize entry_found to 0
+    // search each availible sector for the dir entry
+    for (int i = start_sector; i < end_sector; i++){
+        // search each entry in the sector for the filename 512/32 16 entries per sector 
+        for (int j  = 0; j < SECTOR_SIZE / ENTRY_SIZE; j++){
+            // write the entry to the entry struct and see if it matches our filename
+            fseek(volume->image_buffer, (i * SECTOR_SIZE) + (j * ENTRY_SIZE), SEEK_SET);
+            fread(entry.filename, sizeof(entry.filename), 1, volume->image_buffer);
+            fread(entry.extension, sizeof(entry.extension), 1, volume->image_buffer);
+            fread(&entry.attributes, sizeof(entry.attributes), 1, volume->image_buffer);
+            fread(&entry.reserved, sizeof(entry.reserved), 1, volume->image_buffer);
+            fread(&entry.create_time, sizeof(entry.create_time), 1, volume->image_buffer);
+            fread(&entry.create_date, sizeof(entry.create_date), 1, volume->image_buffer);
+            fread(&entry.last_access_date, sizeof(entry.last_access_date), 1, volume->image_buffer);
+            fread(&entry.last_write_time, sizeof(entry.last_write_time), 1, volume->image_buffer);
+            fread(&entry.hidden_bytes, sizeof(entry.hidden_bytes), 1, volume->image_buffer);
+            fread(&entry.last_write_date, sizeof(entry.last_write_date), 1, volume->image_buffer);
+            fread(&entry.first_logical_cluster, sizeof(entry.first_logical_cluster), 1, volume->image_buffer);
+            fread(&entry.file_size, sizeof(entry.file_size), 1, volume->image_buffer);
+            entry.byte_offset = (i * SECTOR_SIZE) + (j * ENTRY_SIZE); // what byte the entry starts at
+
+            // Disk stores name with padding ex: A.txt -> 'A       .txt'
+            // so transform our name to match
+            char name_on_disk[13];
+            int len = 0; // need external tracker since file name and entry are seperate
+            for (int k = 0; k < 8; k++){
+                if (entry.filename[k] != ' '){
+                    name_on_disk[len] = entry.filename[k];
+                    len++;
+                }
+            }
+            // if an extesion exists add a '.' and the extension to the name_on_disk
+            if (entry.extension[0] != ' '){
+                name_on_disk[len] = '.';
+                len++;
+                for (int k = 0; k < 3; k++){
+                    if (entry.extension[k] != ' '){
+                        name_on_disk[len] = entry.extension[k];
+                        len++;
+                    }
+                }
+            }
+            name_on_disk[len] = '\0';
+            // check if file name matches entries filename
+            if (strcmp(name_on_disk, filename) == 0){
+                entry.entry_found = 1;
+                return entry;
+            }
+        }
+    }
+    return entry;
 }
 
-// read a file from the volume at the specified path.
-// returns
-//  - on success: a pointer to the contents of the file (should be allocated on the heap).
-//  - on error: NULL
-// And, the number of bytes read should be stored at the address pointed to by "bytes_read".
+// walks through the provided path and searches for each file or directory in the path
+// first we search through root directory then we just follow the first logical clusters. 
+static int path_handler(cat16_volume_t *volume, const char *path, cat16_dir_entry_t *entry){
+    int current_sector = ROOT_DIR_START_SECTOR; 
+    int end_sector = ROOT_DIR_END_SECTOR; 
+    entry->entry_found = 0; // initialize entry_found to 0
+
+    const char *path_ptr = path; // so we can move through the path without modifying the original string
+    // skip leading slashs
+    while (*path_ptr == '/'){
+        path_ptr++;
+    }
+    // search each entry
+    while (*path_ptr != '\0'){
+        size_t len = strcspn(path_ptr, "/"); // len of string up to / 
+        char entry_name[13]; // 8 + . + 3 + null terminator
+        // filename too long
+        if (len > sizeof(entry_name)){
+            return -ENAMETOOLONG; 
+        }
+        strncpy(entry_name, path_ptr, len);
+        entry_name[len] = '\0'; 
+        path_ptr += len; 
+        //skip slashes 
+        while(*path_ptr == '/'){
+            path_ptr++;
+        }
+        *entry = search_directory(volume, entry_name, current_sector, end_sector);
+        // no dir/file found
+        if (entry->entry_found == 0){
+            return -ENOENT;
+        }
+        // end of path reached
+        if (*path_ptr == '\0'){
+            return 0; 
+        }
+        // update the current sector to the first logical cluster of the found directory
+        current_sector = 97 + (entry->first_logical_cluster - 2);
+        end_sector = current_sector + 1;
+    }
+    return -ENOENT; // empty path
+}
 
 /*
  * cat16_readfile -- read a file with the specified name
@@ -148,8 +242,72 @@ int cat16_writefile(cat16_volume_t *volume, const char *path, uint8_t *filedata,
  *      ENOENT, EISDIR, and ENOTDIR.
  */
 uint8_t *cat16_readfile(cat16_volume_t *volume, const char *path, size_t *bytes_read){
-    return NULL; 
+    // check for invalid args 
+    if (volume == NULL || path == NULL || bytes_read == NULL){
+        volume->last_error_code = -EINVAL;
+        return NULL;
+    }
+    // search for the file 
+    cat16_dir_entry_t entry;
+    int result = path_handler(volume, path, &entry);
+    // check for errors when searching for the file
+    if (result < 0){
+        volume->last_error_code = result;
+        return NULL;
+    }
+    // found a directory instead of a file
+    if (entry.attributes & 0x10){ 
+        volume->last_error_code = -EISDIR;
+        return NULL;
+    }
+    // reading starts here
+    uint8_t *buffer = malloc(entry.file_size);
+    int remaining_bytes = entry.file_size;
+    int offset = 0;
+    int sector = 97 + (entry.first_logical_cluster - 2);
+    while (remaining_bytes > 0){
+        offset = sector * SECTOR_SIZE;
+        fseek(volume->image_buffer, offset, SEEK_SET);
+        if (remaining_bytes >= SECTOR_SIZE){
+            fread(buffer + (entry.file_size - remaining_bytes), SECTOR_SIZE, 1, volume->image_buffer);
+            remaining_bytes -= SECTOR_SIZE;
+        }
+        else{
+            fread(buffer + (entry.file_size - remaining_bytes), remaining_bytes, 1, volume->image_buffer);
+            remaining_bytes = 0;
+        }
+        sector++; // I dont understand how to get to the next logical cluster, incrementing the sector is wrong unless its continous.
+    }
+    *bytes_read = entry.file_size;   // after the loop, once
+    return buffer;
 }
+
+
+// Need to get read file working before implementing write file.
+// functions remaining 5
+
+
+/*
+ * cat16_writefile -- write a file with the specified name
+ *      (path) to the mounted volume. If successful, the
+ *      newly created file should have the length
+ *      (bytes_to_write) and content (filedata) specified.
+ *      If a file with that name already exists, it should be
+ *      overwritten, and the old file data removed.
+ * Return:
+ *  - 0 (zero) on success.
+ *  - On failures, it should return a negative error code.
+ *      I should be able to pass this error code into the
+ *      cat16_strerror() function, in order to get the
+ *      corresponding error message. The standard system
+ *      error message should be used for ENOSPC, EINVAL,
+ *      ENAMETOOLONG, ENOENT, and ENOTDIR.
+ */
+int cat16_writefile(cat16_volume_t *volume, const char *path, uint8_t *filedata, size_t bytes_to_write){
+    return 0;
+}
+
+
 
 /*
  * cat16_listdir -- retrieve the contents (the entries) of
@@ -248,8 +406,50 @@ int cat16_unlink(cat16_volume_t *volume, const char *path){
  */
 int cat16_rmdir(cat16_volume_t *volume, const char *path){
     return 0;
+    // cat16_dir_entry_t entry;
+    // // check for invalid arguments
+    // if (volume == NULL || path == NULL){
+    //     return -EINVAL;
+    // }
+    // // start at the root directory
+    // int current_sector = ROOT_DIR_START_SECTOR; // root directory starts at sector 65
+    // int end_sector = 96; // end sector of root directory is 96
+
+    // // path handling
+    // char *path_array[path_depth];
+    // split_path(path, path_array);
+
+    // // search for each filname in the path array
+    // for (int i = 0; i < path_depth; i++){
+    //     // search the current directory(root) for the filename
+    //     entry = search_directory(volume, path_array[i], current_sector, end_sector);
+    //     // if entry_name is a directory, continue searching in that directory
+    //     if (entry.attributes == 0x10){ 
+    //         current_sector = 97 + (entry.first_logical_cluster - 2);
+    //         end_sector = current_sector + 1; // after root we just have 1 sector per dir. 
+    //     }
+    //     else{
+    //         // we found a file 
+    //         return -ENOTDIR;
+    //     }
+    // }
+    // // no such file or directory found
+    // if (entry.entry_found == 0){
+    //     return -ENOENT;
+    // }
+    // // mark the directory as deleted
+    // entry.filename[0] = 0xE5;
+    // // write the entry back to the image buffer
+    // fseek(volume->image_buffer, entry.byte_offset, SEEK_SET);
+    // fwrite(entry.filename, sizeof(entry.filename), 1, volume->image_buffer);
+
+    // // zero out the FAT1 entries for the directory
+    // // don't really know what is going on here but i think everything above is fine 
+    // return 0;
 }
 
+
+// the error handling was easy to do. 
 /*
  * cat16_vstrerror -- returns the error message corresponding
  *      to the last function failure. For example, if listdir
@@ -269,7 +469,10 @@ int cat16_rmdir(cat16_volume_t *volume, const char *path){
  *      would do that is if volume is NULL.
  */
 const char *cat16_vstrerror(cat16_volume_t *volume){
-    return NULL;
+    if (volume == NULL){
+        return NULL;
+    }
+    return cat16_strerror(volume->last_error_code);
 }
 
 /*
@@ -295,5 +498,6 @@ const char *cat16_vstrerror(cat16_volume_t *volume){
  *      of your choosing.
  */
 const char *cat16_strerror(int error_code){
-    return NULL;
+    return strerror(error_code);
 }
+

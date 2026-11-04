@@ -1,32 +1,8 @@
 ENV["VAGRANT_DEFAULT_PROVIDER"] ||= "qemu"
 
-RSYNC_AUTO_PID = File.join(__dir__, ".vagrant", "rsync-auto.pid")
-RSYNC_AUTO_LOG = File.join(__dir__, ".vagrant", "rsync-auto.log")
-
-def rsync_auto_running?
-  return false unless File.exist?(RSYNC_AUTO_PID)
-  Process.kill(0, File.read(RSYNC_AUTO_PID).to_i)
-  true
-rescue Errno::ESRCH, Errno::EPERM
-  false
-end
-
-def stop_rsync_auto
-  return unless File.exist?(RSYNC_AUTO_PID)
-  begin
-    Process.kill("TERM", File.read(RSYNC_AUTO_PID).to_i)
-  rescue Errno::ESRCH
-  end
-  File.delete(RSYNC_AUTO_PID)
-end
-
 Vagrant.configure("2") do |config|
   config.vm.box = "perk/ubuntu-2204-arm64"
-
-  config.vm.synced_folder ".", "/vagrant",
-    type: "rsync",
-    rsync__auto: true,
-    rsync__exclude: [".vagrant/", "*.o", "*.a"]
+  config.vm.synced_folder ".", "/vagrant", type: "rsync"
 
   config.vm.provider "qemu" do |qemu|
     qemu.memory = "1G"
@@ -37,28 +13,4 @@ Vagrant.configure("2") do |config|
     apt-get update
     apt-get install -y --no-install-recommends build-essential
   SHELL
-
-  # Start continuous rsync in the background once the VM is up
-  config.trigger.after [:up, :reload, :resume] do |t|
-    t.info = "Starting background rsync-auto (log: .vagrant/rsync-auto.log)"
-    t.ruby do |env, machine|
-      unless rsync_auto_running?
-        pid = Process.spawn("vagrant", "rsync-auto",
-                            chdir: __dir__,
-                            out: RSYNC_AUTO_LOG,
-                            err: [:child, :out],
-                            pgroup: true)
-        Process.detach(pid)
-        File.write(RSYNC_AUTO_PID, pid.to_s)
-      end
-    end
-  end
-
-  # Stop it when the VM goes away
-  config.trigger.before [:halt, :destroy, :reload, :suspend] do |t|
-    t.info = "Stopping background rsync-auto"
-    t.ruby do |env, machine|
-      stop_rsync_auto
-    end
-  end
 end
