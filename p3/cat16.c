@@ -2,7 +2,6 @@
 #include <stdio.h>
 #include <errno.h>
 #include <string.h>
-#include <stdbool.h>
 
 #define filename_bytes 8
 #define extension_bytes 3
@@ -16,7 +15,6 @@
 #define path_depth 99
 #define max_path_length 9999
 #define ENTRY_SIZE 32
-
 
 struct cat16_volume{
     long image_size;
@@ -46,6 +44,58 @@ struct cat16_dir_entry{
     int entry_found; // 1 if found 0 if not found
 };
 
+
+// the error handling was easy to do. 
+/*
+ * cat16_vstrerror -- returns the error message corresponding
+ *      to the last function failure. For example, if listdir
+ *      just returned NULL, then this function would tell us
+ *      why. Error codes should be stored on a per-volume
+ *      basis. This function's behavior is undefined after
+ *      a successful cat16 function return.
+ * Return:
+ *  - On success, it should return an error message
+ *      corresponding to the last cat16_ function failure.
+ *      You should use the standard error messages (returned
+ *      by strerror() for the error codes specified in the
+ *      project description. For any other error codes you
+ *      choose to support, feel free to use an error message
+ *      of your choosing.
+ *  - On failure, it should return NULL. The only time it
+ *      would do that is if volume is NULL.
+ */
+const char *cat16_vstrerror(cat16_volume_t *volume){
+    if (volume == NULL){
+        return NULL;
+    }
+    return cat16_strerror(volume->last_error_code);
+}
+
+/*
+ * cat16_vstrerror -- returns the error message corresponding
+ *      to the error_code, returned from a recent cat16_
+ *      function failure. For example, if mkdir returned
+ *      a negative error code, then this function would
+ *      tell us what that code means. Note that since these
+ *      messages are read only, they can be string constants.
+ *      They do not need to be allocated on the heap. In
+ *      fact, it's best if they are not, because I will not
+ *      free them.
+ * Return:
+ *  - This function should always return an error message
+ *      (including for success (0) and error_codes you don't
+ *      recognize).
+ *      If I pass in an error code you don't recognize, then
+ *      you should still return a default message. You should
+ *      use the standard error messages (returned by
+ *      strerror() for the error codes specified in the
+ *      project description. For any other error codes you
+ *      choose to support, feel free to use an error message
+ *      of your choosing.
+ */
+const char *cat16_strerror(int error_code){
+    return strerror(error_code);
+}
 
 
 /*
@@ -145,7 +195,6 @@ cat16_dir_entry_t search_directory(cat16_volume_t *volume, const char *filename,
             fread(&entry.first_logical_cluster, sizeof(entry.first_logical_cluster), 1, volume->image_buffer);
             fread(&entry.file_size, sizeof(entry.file_size), 1, volume->image_buffer);
             entry.byte_offset = (i * SECTOR_SIZE) + (j * ENTRY_SIZE); // what byte the entry starts at
-
             // Disk stores name with padding ex: A.txt -> 'A       .txt'
             // so transform our name to match
             char name_on_disk[13];
@@ -179,13 +228,12 @@ cat16_dir_entry_t search_directory(cat16_volume_t *volume, const char *filename,
 }
 
 // walks through the provided path and searches for each file or directory in the path
-// first we search through root directory then we just follow the first logical clusters. 
-static int path_handler(cat16_volume_t *volume, const char *path, cat16_dir_entry_t *entry){
+// first search through root directory then just follow the first logical clusters. 
+static int path_handler(cat16_volume_t *volume, const char *path, cat16_dir_entry_t *entry, int write_allowed){
     int current_sector = ROOT_DIR_START_SECTOR; 
     int end_sector = ROOT_DIR_END_SECTOR; 
     entry->entry_found = 0; // initialize entry_found to 0
-
-    const char *path_ptr = path; // so we can move through the path without modifying the original string
+    const char *path_ptr = path; // so I can move through the path without modifying the original string
     // skip leading slashs
     while (*path_ptr == '/'){
         path_ptr++;
@@ -207,7 +255,7 @@ static int path_handler(cat16_volume_t *volume, const char *path, cat16_dir_entr
         }
         *entry = search_directory(volume, entry_name, current_sector, end_sector);
         // no dir/file found
-        if (entry->entry_found == 0){
+        if (entry->entry_found == 0 && write_allowed == 0){
             return -ENOENT;
         }
         // end of path reached
@@ -249,7 +297,7 @@ uint8_t *cat16_readfile(cat16_volume_t *volume, const char *path, size_t *bytes_
     }
     // search for the file 
     cat16_dir_entry_t entry;
-    int result = path_handler(volume, path, &entry);
+    int result = path_handler(volume, path, &entry, 0);
     // check for errors when searching for the file
     if (result < 0){
         volume->last_error_code = result;
@@ -264,7 +312,8 @@ uint8_t *cat16_readfile(cat16_volume_t *volume, const char *path, size_t *bytes_
     uint8_t *buffer = malloc(entry.file_size);
     int remaining_bytes = entry.file_size;
     int offset = 0;
-    int sector = 97 + (entry.first_logical_cluster - 2);
+    uint16_t cluster = entry.first_logical_cluster;
+    int sector = 97 + (cluster - 2);
     while (remaining_bytes > 0){
         offset = sector * SECTOR_SIZE;
         fseek(volume->image_buffer, offset, SEEK_SET);
@@ -276,15 +325,89 @@ uint8_t *cat16_readfile(cat16_volume_t *volume, const char *path, size_t *bytes_
             fread(buffer + (entry.file_size - remaining_bytes), remaining_bytes, 1, volume->image_buffer);
             remaining_bytes = 0;
         }
-        sector++; // I dont understand how to get to the next logical cluster, incrementing the sector is wrong unless its continous.
+        // find next logical cluster
+        // go to start of the fat 
+        // we can jump to the first cluster then just follow jumping around 
+        fseek(volume->image_buffer, (SECTOR_SIZE * 1) + (cluster * sizeof(cluster)), SEEK_SET); // FAT1 STARTS AT SECTOR 1
+        fread(&cluster, sizeof(cluster), 1, volume->image_buffer);
+        sector = 97 + (cluster - 2);
     }
-    *bytes_read = entry.file_size;   // after the loop, once
+    *bytes_read = entry.file_size;
     return buffer;
 }
 
+/*
+ * cat16_unlink -- unlink the file specified by path on the
+ *      volume. This function should follow the approach we
+ *      discussed in class. Mark the directory entry as
+ *      deleted, and zero out its FAT entries. Leave the
+ *      rest of its information (directory entry and
+ *      contents) alone.
+ * Return:
+ *  - On success, it should return zero (0).
+ *  - On failure, it should return a negative error code.
+ *      I should be able to pass this error code to
+ *      cat16_strerror() to retrieve the corresponding error
+ *      message. The standard system error messages
+ *      should be used for EINVAL, ENAMETOOLONG,
+ *      ENOENT, and EISDIR.
+ */
+int cat16_unlink(cat16_volume_t *volume, const char *path){
+        // check for invalid args 
+    if (volume == NULL || path == NULL){
+        volume->last_error_code = -EINVAL;
+        return -EINVAL;
+    }
+    // search for the file 
+    cat16_dir_entry_t entry;
+    int result = path_handler(volume, path, &entry, 0);
+    // check for errors when searching for the file
+    if (result < 0){
+        volume->last_error_code = result;
+        return result;
+    }
+    // found a directory instead of a file
+    if (entry.attributes & 0x10){ 
+        volume->last_error_code = -EISDIR;
+        return -EISDIR;
+    }
+    // set every entry in the fat chain to 0x0000 and mark the directory entry as deleted
+    entry.filename[0] = 0xE5; // mark the directory entry as deleted
+    fseek(volume->image_buffer, entry.byte_offset, SEEK_SET);
+    fwrite(entry.filename, sizeof(entry.filename), 1, volume->image_buffer);
+    uint16_t cluster = entry.first_logical_cluster;
+    while (cluster  >= 0x0002 && cluster <= 0xFFEF){
+        // find next logical cluster
+        // go to start of the fat 
+        // we can jump to the first cluster then just follow jumping around 
+        int fat1_offset = (SECTOR_SIZE * 1) + (cluster * sizeof(cluster));
+        long fat2_offset = (SECTOR_SIZE * 33) + (cluster * sizeof(cluster));
 
-// Need to get read file working before implementing write file.
-// functions remaining 5
+        //find next logical cluster
+        fseek(volume->image_buffer, fat1_offset, SEEK_SET);
+        fread(&cluster, sizeof(cluster), 1, volume->image_buffer);
+        // zero out the fat entries in both FAT1 and FAT2
+        uint16_t zero = 0x0000;
+        fseek(volume->image_buffer, fat1_offset, SEEK_SET);
+        fwrite(&zero, sizeof(zero), 1, volume->image_buffer);
+        fseek(volume->image_buffer, fat2_offset, SEEK_SET);
+        fwrite(&zero, sizeof(zero), 1, volume->image_buffer);
+        // if the next logical cluster is 0xFFFF then we have reached the end of the file
+        if (cluster == 0xFFFF){
+            fseek(volume->image_buffer, fat1_offset, SEEK_SET);
+            fwrite(&zero, sizeof(zero), 1, volume->image_buffer);
+            fseek(volume->image_buffer, fat2_offset, SEEK_SET);
+            fwrite(&zero, sizeof(zero), 1, volume->image_buffer);
+            break;
+        }
+    }
+    return 0;
+}
+
+// to write a new file just sequentially search through clusters not in use
+// if file already exists use any many allocated clusters as possible then add sqeuentiall
+// alternatively you can unlink then the code is the same as 1. 
+
 
 
 /*
@@ -304,9 +427,92 @@ uint8_t *cat16_readfile(cat16_volume_t *volume, const char *path, size_t *bytes_
  *      ENAMETOOLONG, ENOENT, and ENOTDIR.
  */
 int cat16_writefile(cat16_volume_t *volume, const char *path, uint8_t *filedata, size_t bytes_to_write){
+    // check for invalid args 
+    if (volume == NULL || path == NULL || bytes_to_write == NULL || filedata == NULL){
+        volume->last_error_code = -EINVAL;
+        return -EINVAL;
+    }
+    // search for the file 
+    cat16_dir_entry_t entry;
+    int result = path_handler(volume, path, &entry, 1);
+    // check for errors when searching for the file
+    if (result < 0){
+        volume->last_error_code = result;
+        return result;
+    }
+    // found a directory instead of a file
+    if (entry.attributes & 0x10){ 
+        volume->last_error_code = -EISDIR;
+        return -EISDIR;
+    }
+    // writing starts here two cases 
+    // case 1: file already exists, unlink it and write new data
+    
+    if (entry.entry_found == 1){
+        cat16_unlink(volume, path);
+    }
+    // now unlink case one file exists is same as case 2 file does not exist.
+    // write new data 
+    int remaining_bytes = bytes_to_write;
+    int offset = 0;
+    uint16_t cluster = 0; 
+    // find first available logical cluster
+    for (uint16_t i = 0x0002; i <= 0xFFEF; i++){
+        fseek(volume->image_buffer, (SECTOR_SIZE * 1) + (i * sizeof(i)), SEEK_SET);
+        fread(&cluster, sizeof(cluster), 1, volume->image_buffer);
+        if (cluster == 0x0000){
+            cluster = i;
+            break;
+        }
+        // if we are at the end of the FAT and we have not found an available cluster then we are out of space
+        if (i == 0xFFEF && cluster == 0x0000){
+            volume->last_error_code = -ENOSPC;
+            return -ENOSPC;
+        }
+    } 
+    int sector = 97 + (cluster - 2);
+    while (remaining_bytes > 0){
+        offset = sector * SECTOR_SIZE;
+        fseek(volume->image_buffer, offset, SEEK_SET);
+        if (remaining_bytes >= SECTOR_SIZE){
+            fwrite(filedata + (bytes_to_write - remaining_bytes), SECTOR_SIZE, 1, volume->image_buffer);
+            remaining_bytes -= SECTOR_SIZE;
+            // find next available logical cluster
+            uint16_t next_cluster = 0;
+            for (uint16_t i = 0x0002; i <= 0xFFEF; i++){
+                fseek(volume->image_buffer, (SECTOR_SIZE * 1) + (i * sizeof(i)), SEEK_SET);
+                fread(&next_cluster, sizeof(next_cluster), 1, volume->image_buffer);
+                if (next_cluster == 0x0000){
+                    next_cluster = i;
+                    break;
+                }
+                // out of space check 
+                if (i == 0xFFEF && next_cluster == 0x0000){
+                    volume->last_error_code = -ENOSPC;
+                    return -ENOSPC;
+                }
+            }
+            // link the current cluster to the next cluster in the FAT
+            fseek(volume->image_buffer, (SECTOR_SIZE * 1) + (cluster * sizeof(cluster)), SEEK_SET);
+            fwrite(&next_cluster, sizeof(next_cluster), 1, volume->image_buffer);
+            cluster = next_cluster;
+            sector = 97 + (cluster - 2);  
+        }
+        else{
+            fwrite(filedata + (bytes_to_write - remaining_bytes), remaining_bytes, 1, volume->image_buffer);
+            remaining_bytes = 0;
+            // mark the end of the file in the FAT
+            fseek(volume->image_buffer, (SECTOR_SIZE * 1) + (cluster * sizeof(cluster)), SEEK_SET);
+            uint16_t eof = 0xFFFF;
+            fwrite(&eof, sizeof(eof), 1, volume->image_buffer); 
+        }
+  
+    }
     return 0;
 }
 
+
+// saving directory handling for tomorrow. 
 
 
 /*
@@ -368,25 +574,7 @@ int cat16_mkdir(cat16_volume_t *volume, const char *path){
     return 0;
 }
 
-/*
- * cat16_unlink -- unlink the file specified by path on the
- *      volume. This function should follow the approach we
- *      discussed in class. Mark the directory entry as
- *      deleted, and zero out its FAT entries. Leave the
- *      rest of its information (directory entry and
- *      contents) alone.
- * Return:
- *  - On success, it should return zero (0).
- *  - On failure, it should return a negative error code.
- *      I should be able to pass this error code to
- *      cat16_strerror() to retrieve the corresponding error
- *      message. The standard system error messages
- *      should be used for EINVAL, ENAMETOOLONG,
- *      ENOENT, and EISDIR.
- */
-int cat16_unlink(cat16_volume_t *volume, const char *path){
-    return 0;
-}
+
 
 /*
  * cat16_rmdir -- removes a directory with the specified
@@ -406,98 +594,4 @@ int cat16_unlink(cat16_volume_t *volume, const char *path){
  */
 int cat16_rmdir(cat16_volume_t *volume, const char *path){
     return 0;
-    // cat16_dir_entry_t entry;
-    // // check for invalid arguments
-    // if (volume == NULL || path == NULL){
-    //     return -EINVAL;
-    // }
-    // // start at the root directory
-    // int current_sector = ROOT_DIR_START_SECTOR; // root directory starts at sector 65
-    // int end_sector = 96; // end sector of root directory is 96
-
-    // // path handling
-    // char *path_array[path_depth];
-    // split_path(path, path_array);
-
-    // // search for each filname in the path array
-    // for (int i = 0; i < path_depth; i++){
-    //     // search the current directory(root) for the filename
-    //     entry = search_directory(volume, path_array[i], current_sector, end_sector);
-    //     // if entry_name is a directory, continue searching in that directory
-    //     if (entry.attributes == 0x10){ 
-    //         current_sector = 97 + (entry.first_logical_cluster - 2);
-    //         end_sector = current_sector + 1; // after root we just have 1 sector per dir. 
-    //     }
-    //     else{
-    //         // we found a file 
-    //         return -ENOTDIR;
-    //     }
-    // }
-    // // no such file or directory found
-    // if (entry.entry_found == 0){
-    //     return -ENOENT;
-    // }
-    // // mark the directory as deleted
-    // entry.filename[0] = 0xE5;
-    // // write the entry back to the image buffer
-    // fseek(volume->image_buffer, entry.byte_offset, SEEK_SET);
-    // fwrite(entry.filename, sizeof(entry.filename), 1, volume->image_buffer);
-
-    // // zero out the FAT1 entries for the directory
-    // // don't really know what is going on here but i think everything above is fine 
-    // return 0;
 }
-
-
-// the error handling was easy to do. 
-/*
- * cat16_vstrerror -- returns the error message corresponding
- *      to the last function failure. For example, if listdir
- *      just returned NULL, then this function would tell us
- *      why. Error codes should be stored on a per-volume
- *      basis. This function's behavior is undefined after
- *      a successful cat16 function return.
- * Return:
- *  - On success, it should return an error message
- *      corresponding to the last cat16_ function failure.
- *      You should use the standard error messages (returned
- *      by strerror() for the error codes specified in the
- *      project description. For any other error codes you
- *      choose to support, feel free to use an error message
- *      of your choosing.
- *  - On failure, it should return NULL. The only time it
- *      would do that is if volume is NULL.
- */
-const char *cat16_vstrerror(cat16_volume_t *volume){
-    if (volume == NULL){
-        return NULL;
-    }
-    return cat16_strerror(volume->last_error_code);
-}
-
-/*
- * cat16_vstrerror -- returns the error message corresponding
- *      to the error_code, returned from a recent cat16_
- *      function failure. For example, if mkdir returned
- *      a negative error code, then this function would
- *      tell us what that code means. Note that since these
- *      messages are read only, they can be string constants.
- *      They do not need to be allocated on the heap. In
- *      fact, it's best if they are not, because I will not
- *      free them.
- * Return:
- *  - This function should always return an error message
- *      (including for success (0) and error_codes you don't
- *      recognize).
- *      If I pass in an error code you don't recognize, then
- *      you should still return a default message. You should
- *      use the standard error messages (returned by
- *      strerror() for the error codes specified in the
- *      project description. For any other error codes you
- *      choose to support, feel free to use an error message
- *      of your choosing.
- */
-const char *cat16_strerror(int error_code){
-    return strerror(error_code);
-}
-
