@@ -1,3 +1,10 @@
+/*
+Student: Kevius Tribble
+Instructor: Jacob Sorber
+CPSC 3020
+10/9/2025
+*/
+
 #include "cat16.h"
 #include <stdio.h>
 #include <errno.h>
@@ -29,6 +36,8 @@ struct cat16_volume{
     int last_error_code; 
 };
 
+typedef struct cat16_dir_entry cat16_dir_entry_t;
+
 struct cat16_dir_entry{
     char filename[filename_bytes]; // add the null terminator 
     char extension[extension_bytes];
@@ -48,21 +57,45 @@ struct cat16_dir_entry{
     char disk_name[filename_bytes + extension_bytes + 2]; // 8 + 3 + . + null terminator
     int start_sector; 
     int end_sector;
+    uint16_t parent_cluster; // parent cluster. 
 };
 
 // my helper functions 
 
+//read a clusters value from the fat
+static uint16_t read_fat_entry(cat16_volume_t *volume, uint16_t cluster){
+    uint16_t value;
+    fseek(volume->image_buffer, (SECTOR_SIZE * 1) + (cluster * sizeof(cluster)), SEEK_SET); // FAT1 STARTS AT SECTOR 1
+    fread(&value, sizeof(value), 1, volume->image_buffer);
+    return value;
+}
+
+//next clsuter in a directories fat chain
+static uint16_t next_dir_cluster(cat16_volume_t *volume, uint16_t cluster){
+    uint16_t next_cluster = read_fat_entry(volume, cluster);
+    if (next_cluster >= 0x0002 && next_cluster <= 0xFFEF){
+        return next_cluster;
+    }
+    return 0;
+}
+
+
 // move through the fat looking for a free cluster. returns the cluster number of the first free cluster found.
 static uint16_t find_free_cluster(cat16_volume_t *volume){
     for (uint16_t cluster = 0x0002; cluster < 0xFFEF; cluster++){
-        uint16_t value;
-        fseek(volume->image_buffer, (SECTOR_SIZE * 1) + (cluster * sizeof(cluster)), SEEK_SET); // FAT1 STARTS AT SECTOR 1
-        fread(&value, sizeof(value), 1, volume->image_buffer);
+        uint16_t value = read_fat_entry(volume, cluster); // raw value. next_dir_cluster would also return 0 for 0xFFFF
         if (value == 0x0000){
             return cluster;
         }
     }
     return 0xFFFF; // no free clusters found | out of space
+}
+
+//zero out a cluster in the data region.
+static void zero_out_cluster(cat16_volume_t *volume, uint16_t cluster){
+    fseek(volume->image_buffer, (97 + (cluster - 2)) * SECTOR_SIZE, SEEK_SET);
+    uint8_t zero_buffer[SECTOR_SIZE] = {0};
+    fwrite(zero_buffer, sizeof(zero_buffer), 1, volume->image_buffer);
 }
 
 //write a cluster number to the fat table at the specified cluster number.
@@ -73,47 +106,90 @@ static void write_fat_entry(cat16_volume_t *volume, uint16_t cluster, uint16_t v
     fwrite(&value, sizeof(value), 1, volume->image_buffer);
 }
 
+
+//add a cluster to the end of a directory's fat chain.
+static uint16_t grow_directory(cat16_volume_t *volume, uint16_t cluster){
+    if (cluster == 0x0000){
+        return 0xFFFF; //cant grow root directory
+    }
+
+    //go to last cluster in the directories fat chain
+    uint16_t last_cluster = cluster;
+    uint16_t next_cluster = next_dir_cluster(volume, last_cluster);
+    while (next_cluster !=0x0000){
+        last_cluster = next_cluster;
+        next_cluster = next_dir_cluster(volume, last_cluster);
+    }
+    // find a free cluster to add to the end of the chain
+    uint16_t free_cluster = find_free_cluster(volume);
+    if (free_cluster == 0xFFFF){
+        return 0xFFFF; // no free clusters found | out of space
+    }
+    // write the free cluster to the end of the directories fat chain
+    write_fat_entry(volume, last_cluster, free_cluster);
+    write_fat_entry(volume, free_cluster, 0xFFFF); //end
+    // zero out the new cluster
+    zero_out_cluster(volume, free_cluster);
+    return free_cluster;
+}
+
 // search directory for a file or directory with the specified filename.
 // returns a struct representing the directory entry if found, else empty entry with entry_found = 0 
-static cat16_dir_entry_t search_directory(cat16_volume_t *volume, const char *filename, const char *extension, int start_sector, int end_sector){
-    cat16_dir_entry_t entry;
+static cat16_dir_entry_t search_directory(cat16_volume_t *volume, const char *filename, const char *extension, uint16_t dir_cluster){
+    cat16_dir_entry_t entry = {0};
     entry.entry_found = 0; // initialize entry_found to 0
-    entry.start_sector = start_sector;
-    entry.end_sector = end_sector;
-    // search each availible sector for the dir entry
-    for (int i = start_sector; i < end_sector; i++){
-        // search each entry in the sector for the filename 512/32 16 entries per sector 
-        for (int j  = 0; j < SECTOR_SIZE / ENTRY_SIZE; j++){
-            // write the entry to the entry struct and see if it matches our filename
-            fseek(volume->image_buffer, (i * SECTOR_SIZE) + (j * ENTRY_SIZE), SEEK_SET);
-            fread(entry.filename, sizeof(entry.filename), 1, volume->image_buffer);
-            fread(entry.extension, sizeof(entry.extension), 1, volume->image_buffer);
-            fread(&entry.attributes, sizeof(entry.attributes), 1, volume->image_buffer);
-            fread(&entry.reserved, sizeof(entry.reserved), 1, volume->image_buffer);
-            fread(&entry.create_time, sizeof(entry.create_time), 1, volume->image_buffer);
-            fread(&entry.create_date, sizeof(entry.create_date), 1, volume->image_buffer);
-            fread(&entry.last_access_date, sizeof(entry.last_access_date), 1, volume->image_buffer);
-            fread(&entry.last_write_time, sizeof(entry.last_write_time), 1, volume->image_buffer);
-            fread(&entry.hidden_bytes, sizeof(entry.hidden_bytes), 1, volume->image_buffer);
-            fread(&entry.last_write_date, sizeof(entry.last_write_date), 1, volume->image_buffer);
-            fread(&entry.first_logical_cluster, sizeof(entry.first_logical_cluster), 1, volume->image_buffer);
-            fread(&entry.file_size, sizeof(entry.file_size), 1, volume->image_buffer);
-            entry.byte_offset = (i * SECTOR_SIZE) + (j * ENTRY_SIZE); // what byte the entry starts at
-            // check if the entry is deleted. 
-            if (entry.filename[0] == 0xE5){
-                entry.deleted = true;
-            }
-            else{
-                entry.deleted = false;
-            }
-            // check if file name matches entries filename
-            if (memcmp(entry.filename, filename, 8) == 0 && memcmp(entry.extension, extension, 3) == 0){
-                entry.entry_found = 1;
-                return entry;
+    entry.parent_cluster = dir_cluster;
+    uint16_t cluster = dir_cluster;
+    int start_sector = ROOT_DIR_START_SECTOR;
+    int end_sector = ROOT_DIR_END_SECTOR;
+    if (dir_cluster != 0x0000){ // subdirectory. one sector per cluster
+        start_sector = 97 + (dir_cluster - 2);
+        end_sector = start_sector + 1;
+    }
+    while (true){
+        for (int i = start_sector; i < end_sector; i++){
+            for (int j  = 0; j < SECTOR_SIZE / ENTRY_SIZE; j++){
+                fseek(volume->image_buffer, (i * SECTOR_SIZE) + (j * ENTRY_SIZE), SEEK_SET);
+                fread(entry.filename, sizeof(entry.filename), 1, volume->image_buffer);
+                fread(entry.extension, sizeof(entry.extension), 1, volume->image_buffer);
+                fread(&entry.attributes, sizeof(entry.attributes), 1, volume->image_buffer);
+                fread(&entry.reserved, sizeof(entry.reserved), 1, volume->image_buffer);
+                fread(&entry.create_time, sizeof(entry.create_time), 1, volume->image_buffer);
+                fread(&entry.create_date, sizeof(entry.create_date), 1, volume->image_buffer);
+                fread(&entry.last_access_date, sizeof(entry.last_access_date), 1, volume->image_buffer);
+                fread(&entry.last_write_time, sizeof(entry.last_write_time), 1, volume->image_buffer);
+                fread(&entry.hidden_bytes, sizeof(entry.hidden_bytes), 1, volume->image_buffer);
+                fread(&entry.last_write_date, sizeof(entry.last_write_date), 1, volume->image_buffer);
+                fread(&entry.first_logical_cluster, sizeof(entry.first_logical_cluster), 1, volume->image_buffer);
+                fread(&entry.file_size, sizeof(entry.file_size), 1, volume->image_buffer);
+                entry.byte_offset = (i * SECTOR_SIZE) + (j * ENTRY_SIZE);
+                if ((unsigned char)entry.filename[0] == 0xE5){
+                    entry.deleted = true;
+                }
+                else{
+                    entry.deleted = false;
+                }
+                // deleted and unused entries can't match
+                if (entry.deleted || (unsigned char)entry.filename[0] == 0x00){
+                    continue;
+                }
+                if (memcmp(entry.filename, filename, 8) == 0 && memcmp(entry.extension, extension, 3) == 0){
+                    entry.entry_found = 1;
+                    return entry;
+                }
             }
         }
+        // not in this cluster. the root has no chain. otherwise follow the fat to the next cluster of THIS directory.
+        if (cluster == 0x0000){
+            return entry;
+        }
+        cluster = next_dir_cluster(volume, cluster);
+        if (cluster == 0x0000){
+            return entry; // no more clusters in the chain
+        }
+        start_sector = 97 + (cluster - 2);
+        end_sector = start_sector + 1;
     }
-    return entry;
 }
 
 // check all 16 entries availible in a sector and store them in the dir_entries array.
@@ -137,7 +213,7 @@ static void scan_sector(cat16_volume_t *volume, int sector, cat16_dirent_t *dir_
         fread(&entry.file_size, sizeof(entry.file_size), 1, volume->image_buffer);
         entry.byte_offset = (sector * SECTOR_SIZE) + (j * ENTRY_SIZE); // what byte the entry starts at
         // check if the entry is deleted or unused.
-        if (entry.filename[0] == 0xE5 || entry.filename[0] == 0x00){
+        if ((unsigned char)entry.filename[0] == 0xE5 || (unsigned char)entry.filename[0] == 0x00){
             continue; // skip deleted or unused entries
         }
         // Disk stores name with padding ex: A.txt -> 'A       .txt'
@@ -171,7 +247,6 @@ static void scan_sector(cat16_volume_t *volume, int sector, cat16_dirent_t *dir_
         strncpy(dirent.name, name_on_disk, sizeof(dirent.name));
         dirent.attributes = entry.attributes;
         dirent.size = entry.file_size;
-        dirent.deleted = entry.deleted;
         // add the entry to the dir_entries array
         dir_entries[*entries_read] = dirent;
         (*entries_read)++;
@@ -181,8 +256,7 @@ static void scan_sector(cat16_volume_t *volume, int sector, cat16_dirent_t *dir_
 // walks through the provided path and searches for each file or directory in the path
 // first search through root directory then just follow the first logical clusters. 
 static int path_handler(cat16_volume_t *volume, const char *path, cat16_dir_entry_t *entry, int write_allowed, char *filename_out, char *extension_out){
-    int current_sector = ROOT_DIR_START_SECTOR; 
-    int end_sector = ROOT_DIR_END_SECTOR; 
+    int current_cluster = 0x0000; // start at root directory
     entry->entry_found = 0; // initialize entry_found to 0
 
     // HANDLE THE PATH
@@ -227,7 +301,7 @@ static int path_handler(cat16_volume_t *volume, const char *path, cat16_dir_entr
         // PATH HANDLING END 
 
         // search for the entry in the current directory
-        *entry = search_directory(volume, filename_internal, extension_internal, current_sector, end_sector);
+        *entry = search_directory(volume, filename_internal, extension_internal, current_cluster);
         // no dir/file found. only ok if we're creating the last component
         if (entry->entry_found == 0 && (write_allowed == 0 || i != token_count - 1)){ 
             return -ENOENT;
@@ -235,8 +309,8 @@ static int path_handler(cat16_volume_t *volume, const char *path, cat16_dir_entr
         // end of path reached
         if (i == token_count - 1){
             if (filename_out != NULL && extension_out != NULL){
-                memcpy(filename_out, filename_internal, sizeof(filename_internal));
-                memcpy(extension_out, extension_internal, sizeof(extension_internal));
+                strncpy(filename_out, filename_internal, sizeof(filename_internal) - 1 );
+                strncpy(extension_out, extension_internal, sizeof(extension_internal)- 1); // excluding the null terminator
             }
             return 0; 
         }
@@ -244,8 +318,7 @@ static int path_handler(cat16_volume_t *volume, const char *path, cat16_dir_entr
         if (!(entry->attributes & 0x10)){ 
             return -ENOTDIR;
         }
-        current_sector = 97 + (entry->first_logical_cluster - 2);
-        end_sector = current_sector + 1;
+        current_cluster = entry->first_logical_cluster;
     }
     return -ENOENT; // empty path
 }
@@ -262,31 +335,64 @@ static int write_dir_entry(cat16_volume_t *volume, cat16_dir_entry_t *entry, uin
     entry->last_write_date = 0;
     entry->first_logical_cluster = first_logical_cluster;
     entry->file_size = bytes_to_write;
-    // find a  free entry in bewtween the start and end sectors of the dir. 
-    for (int i = entry->start_sector; i < entry->end_sector; i++){
-        for (int j = 0; j < SECTOR_SIZE / ENTRY_SIZE; j++){
-            fseek(volume->image_buffer, (i * SECTOR_SIZE) + (j * ENTRY_SIZE), SEEK_SET);
-            uint8_t first_byte;
-            fread(&first_byte, sizeof(first_byte), 1, volume->image_buffer);
-            if (first_byte == 0x00 || first_byte == 0xE5){ // free entry found
+    // the DIRECTORY we are writing into is entry->parent_cluster. (first_logical_cluster is what the new entry points to)
+    uint16_t cluster = entry->parent_cluster;
+    int start_sector = ROOT_DIR_START_SECTOR;
+    int end_sector = ROOT_DIR_END_SECTOR;
+    if (cluster != 0x0000){ // subdirectory
+        start_sector = 97 + (cluster - 2);
+        end_sector = start_sector + 1;
+    }
+    while (true){
+        // find a  free entry in bewtween the start and end sectors of the dir. 
+        for (int i = start_sector; i < end_sector; i++){
+            for (int j = 0; j < SECTOR_SIZE / ENTRY_SIZE; j++){
                 fseek(volume->image_buffer, (i * SECTOR_SIZE) + (j * ENTRY_SIZE), SEEK_SET);
-                fwrite(entry->filename, sizeof(entry->filename), 1, volume->image_buffer);
-                fwrite(entry->extension, sizeof(entry->extension), 1, volume->image_buffer);
-                fwrite(&entry->attributes, sizeof(entry->attributes), 1, volume->image_buffer);
-                fwrite(&entry->reserved, sizeof(entry->reserved), 1, volume->image_buffer);
-                fwrite(&entry->create_time, sizeof(entry->create_time), 1, volume->image_buffer);
-                fwrite(&entry->create_date, sizeof(entry->create_date), 1, volume->image_buffer);
-                fwrite(&entry->last_access_date, sizeof(entry->last_access_date), 1, volume->image_buffer);
-                fwrite(&entry->hidden_bytes, sizeof(entry->hidden_bytes), 1, volume->image_buffer);
-                fwrite(&entry->last_write_time, sizeof(entry->last_write_time), 1, volume->image_buffer);
-                fwrite(&entry->last_write_date, sizeof(entry->last_write_date), 1, volume->image_buffer);
-                fwrite(&entry->first_logical_cluster, sizeof(entry->first_logical_cluster), 1, volume->image_buffer);
-                fwrite(&entry->file_size, sizeof(entry->file_size), 1, volume->image_buffer);
-                return 0; // success
+                uint8_t first_byte;
+                fread(&first_byte, sizeof(first_byte), 1, volume->image_buffer);
+                if (first_byte == 0x00 || first_byte == 0xE5){ // free entry found
+                    fseek(volume->image_buffer, (i * SECTOR_SIZE) + (j * ENTRY_SIZE), SEEK_SET);
+                    fwrite(entry->filename, sizeof(entry->filename), 1, volume->image_buffer);
+                    fwrite(entry->extension, sizeof(entry->extension), 1, volume->image_buffer);
+                    fwrite(&entry->attributes, sizeof(entry->attributes), 1, volume->image_buffer);
+                    fwrite(&entry->reserved, sizeof(entry->reserved), 1, volume->image_buffer);
+                    fwrite(&entry->create_time, sizeof(entry->create_time), 1, volume->image_buffer);
+                    fwrite(&entry->create_date, sizeof(entry->create_date), 1, volume->image_buffer);
+                    fwrite(&entry->last_access_date, sizeof(entry->last_access_date), 1, volume->image_buffer);
+                    fwrite(&entry->hidden_bytes, sizeof(entry->hidden_bytes), 1, volume->image_buffer);
+                    fwrite(&entry->last_write_time, sizeof(entry->last_write_time), 1, volume->image_buffer);
+                    fwrite(&entry->last_write_date, sizeof(entry->last_write_date), 1, volume->image_buffer);
+                    fwrite(&entry->first_logical_cluster, sizeof(entry->first_logical_cluster), 1, volume->image_buffer);
+                    fwrite(&entry->file_size, sizeof(entry->file_size), 1, volume->image_buffer);
+                    return 0; // success
+                }
             }
         }
+        // no free entry in this cluster. the root has no chain. otherwise follow the fat to the next cluster of this directory.
+        if (cluster == 0x0000){
+            return 1; // root directory is full
+        }
+        cluster = next_dir_cluster(volume, cluster);
+        if (cluster == 0x0000){
+            return 1; // end of the chain. no free entry found we need to see if there is a new cluster available to add to the directory.
+        }
+        start_sector = 97 + (cluster - 2);
+        end_sector = start_sector + 1;
     }
-    return -ENOSPC; // no free entry found
+}
+
+static int add_dir_entry(cat16_volume_t *volume, cat16_dir_entry_t *entry, uint8_t attributes, uint16_t first_logical_cluster, uint32_t bytes_to_write){
+    int result = write_dir_entry(volume, entry, attributes, first_logical_cluster, bytes_to_write);
+    if (result == 1){
+        if (grow_directory(volume, entry->parent_cluster) == 0xFFFF){
+            return -ENOSPC;
+        }
+        result = write_dir_entry(volume, entry, attributes, first_logical_cluster, bytes_to_write);
+        if (result == 1){
+            return -ENOSPC; // no free entry found after growing directory
+        }
+    }
+    return 0; // success
 }
 
 // the error handling was easy to do. 
@@ -339,6 +445,8 @@ const char *cat16_vstrerror(cat16_volume_t *volume){
  */
 const char *cat16_strerror(int error_code){
     switch (error_code){
+    case 0:
+        return "Success";
     case -EINVAL:
         return strerror(EINVAL);
     case -ENAMETOOLONG:
@@ -353,8 +461,10 @@ const char *cat16_strerror(int error_code){
         return strerror(EISDIR);
     case -ENOSPC:
         return strerror(ENOSPC);
+    case -EEXIST:
+        return strerror(EEXIST);
     default:
-        return 0;
+        return "no clue what you did tbh";
     }
 }
 
@@ -606,8 +716,8 @@ int cat16_writefile(cat16_volume_t *volume, const char *path, uint8_t *filedata,
     }
     // after unlinking. case 1 is same as case 2 file does not exist
     // write the file to the image buffer and update the FAT table and dir entry
-    memcpy(entry.filename, filename, sizeof(entry.filename));
-    memcpy(entry.extension, extension, sizeof(entry.extension));
+    strncpy(entry.filename, filename, sizeof(entry.filename));
+    strncpy(entry.extension, extension, sizeof(entry.extension));
     int remaining_bytes = bytes_to_write;
     int offset = 0;
     uint16_t cluster = find_free_cluster(volume);
@@ -643,16 +753,13 @@ int cat16_writefile(cat16_volume_t *volume, const char *path, uint8_t *filedata,
             sector = 97 + (cluster - 2);
         }
     }
-    //set the filename and extension in the entry struct
-    strncpy(entry.filename, filename, sizeof(entry.filename));
-    strncpy(entry.extension, extension, sizeof(entry.extension));
-
-    // write the directory entry for the new file
-    int dir_write_result = write_dir_entry(volume, &entry, 0x20, first_logical_cluster, bytes_to_write);
-    if (dir_write_result < 0){
-        volume->last_error_code = dir_write_result;
-        return dir_write_result;
+    // add the directory entry for the new file
+    result = add_dir_entry(volume, &entry, 0x20, first_logical_cluster, bytes_to_write); // 0x20 is the attribute for a normal file
+    if (result < 0){
+        volume->last_error_code = result;
+        return result;
     }
+
     return 0;
 }
 
@@ -711,7 +818,7 @@ cat16_dirent_t *cat16_listdir(cat16_volume_t *volume, const char *path, size_t *
             scan_sector(volume, i, dir_entries, entries_read);
         }
     // other wise I gotta search each sector and find the next one with the fat table
-    } else {
+    }else{
         uint16_t cluster = entry.first_logical_cluster;
         int sector = 97 + (cluster - 2);
         while (cluster >= 0x0002 && cluster <= 0xFFEF){
@@ -792,56 +899,40 @@ int cat16_mkdir(cat16_volume_t *volume, const char *path){
         volume->last_error_code = -EEXIST;
         return -EEXIST;
     }
-    cat16_dir_entry_t entry;
-    memcpy(entry.filename, filename, sizeof(entry.filename));
-    memcpy(entry.extension, extension, sizeof(entry.extension));
-
     // find a free cluster for the new directory
     uint16_t cluster = find_free_cluster(volume);
     if (cluster == 0xFFFF){
         volume->last_error_code = -ENOSPC;
         return -ENOSPC;
     }
-    // write the new directory entry to the parent directory
-    entry.start_sector = lookup.start_sector;
-    entry.end_sector = lookup.end_sector;
-    int dir_write_result = write_dir_entry(volume, &entry, 0x10, cluster, 0);
+    write_fat_entry(volume, cluster, 0xFFFF); // mark the first cluster as end of file in the FAT
+    // zero out the new directory cluster (pass the CLUSTER, zero_out_cluster converts it to a sector)
+    zero_out_cluster(volume, cluster);
+
+    // write the directory entry for the new directory (into the parent. lookup.parent_cluster, 0 = root)
+    cat16_dir_entry_t entry = {0};
+    strncpy(entry.filename, filename, sizeof(entry.filename));
+    strncpy(entry.extension, extension, sizeof(entry.extension));
+    entry.parent_cluster = lookup.parent_cluster;
+    int dir_write_result = add_dir_entry(volume, &entry, 0x10, cluster, 0);
     if (dir_write_result < 0){
+        write_fat_entry(volume, cluster, 0x0000); 
         volume->last_error_code = dir_write_result;
         return dir_write_result;
     }
-    // create the new directory by writing the "." and ".." entries to it
-    uint16_t parent_cluster; 
-    // see if the parent directory is root or not
-    if (lookup.start_sector == ROOT_DIR_START_SECTOR && lookup.end_sector == ROOT_DIR_END_SECTOR){
-        parent_cluster = 0x0000; // root directory has no parent
-    } else {
-        parent_cluster = lookup.start_sector - 97 + 2; // parent directory's first logical cluster
-    }
-    // write the "." entry
-    cat16_dir_entry_t dot_entry;
-    memcpy(dot_entry.filename, ".", 1);
-    memcpy(dot_entry.extension, "   ", 3);
-    dot_entry.attributes = 0x10; // directory
-    dot_entry.first_logical_cluster = cluster; 
-    dot_entry.file_size = 0;
-    dot_entry.start_sector = 97 + (cluster - 2);
-    dot_entry.end_sector = dot_entry.start_sector + 1;
-    write_dir_entry(volume, &dot_entry, 0x10, cluster, 0);
-    // write the ".." entry
-    cat16_dir_entry_t dotdot_entry;
-    memcpy(dotdot_entry.filename, "..", 2);
-    memcpy(dotdot_entry.extension, "   ", 3);
-    dotdot_entry.attributes = 0x10; // directory
-    dotdot_entry.first_logical_cluster = parent_cluster;
-    dotdot_entry.file_size = 0;
-    dotdot_entry.start_sector = 97 + (cluster - 2);
-    dotdot_entry.end_sector = dotdot_entry.start_sector + 1;
-    write_dir_entry(volume, &dotdot_entry, 0x10, parent_cluster, 0);
 
-    
-    // mark end of file in the fat
-    write_fat_entry(volume, cluster, 0xFFFF);
+    // write the "." entry (into the NEW directory)
+    cat16_dir_entry_t dot_entry;
+    memcpy(dot_entry.filename, ".       ", 8);
+    memcpy(dot_entry.extension, "   ", 3);
+    dot_entry.parent_cluster = cluster;
+    write_dir_entry(volume, &dot_entry, 0x10, cluster, 0);
+    // write the ".." entry (into the NEW directory, points at the parent. 0 if the parent is root)
+    cat16_dir_entry_t dotdot_entry;
+    memcpy(dotdot_entry.filename, "..      ", 8);
+    memcpy(dotdot_entry.extension, "   ", 3);
+    dotdot_entry.parent_cluster = cluster;
+    write_dir_entry(volume, &dotdot_entry, 0x10, lookup.parent_cluster, 0);
     return 0;
 }
 
