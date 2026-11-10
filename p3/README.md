@@ -35,6 +35,8 @@ gcc -o test  test.c libworkqueue.a
 
 ## KNOWN PROBLEMS
 
+Writes are slow as sectors fill up. LIkely becuase I check every availible cluster 0002 - 0xffef 
+
 ## DESIGN
 
 Files
@@ -45,7 +47,7 @@ makefile -> makes code compilation ez
 Design Choices
 
 - fopen + fseek = oepn the file and then jump around with an offset of bytes. great if the file is too bing to load into vritual memory -> buffer + jump around | i think this would be easier to explain on a quiz.
-- memset & memcmp = compiler would through errors since cstrings are expected to have a null terminator
+- memset & memcmp = compiler would throw errors since cstrings are expected to have a null terminator
 
 ```shell
 make

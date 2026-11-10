@@ -24,6 +24,7 @@ CPSC 3020
 #define ENTRY_SIZE 32
 #define MAX_DIR_ENTRIES 9999
 #define max_number_of_tokens 99999
+#define FINAL_AVAILABLE_CLUSTER (TOTAL_SECTORS - ROOT_DIR_END_SECTOR + 1)
 
 struct cat16_volume{
     long image_size;
@@ -82,7 +83,7 @@ static uint16_t next_dir_cluster(cat16_volume_t *volume, uint16_t cluster){
 
 // move through the fat looking for a free cluster. returns the cluster number of the first free cluster found.
 static uint16_t find_free_cluster(cat16_volume_t *volume){
-    for (uint16_t cluster = 0x0002; cluster < 0xFFEF; cluster++){
+    for (uint16_t cluster = 0x0002; cluster <= FINAL_AVAILABLE_CLUSTER; cluster++){
         uint16_t value = read_fat_entry(volume, cluster); // raw value. next_dir_cluster would also return 0 for 0xFFFF
         if (value == 0x0000){
             return cluster;
@@ -98,7 +99,7 @@ static void zero_out_cluster(cat16_volume_t *volume, uint16_t cluster){
     fwrite(zero_buffer, sizeof(zero_buffer), 1, volume->image_buffer);
 }
 
-//write a cluster number to the fat table at the specified cluster number.
+// update the fat 1 & 2 table with the cluster an entry points 2
 static void write_fat_entry(cat16_volume_t *volume, uint16_t cluster, uint16_t value){
     fseek(volume->image_buffer, (SECTOR_SIZE * 1) + (cluster * sizeof(cluster)), SEEK_SET); // FAT1 STARTS AT SECTOR 1
     fwrite(&value, sizeof(value), 1, volume->image_buffer);
@@ -112,7 +113,6 @@ static uint16_t grow_directory(cat16_volume_t *volume, uint16_t cluster){
     if (cluster == 0x0000){
         return 0xFFFF; //cant grow root directory
     }
-
     //go to last cluster in the directories fat chain
     uint16_t last_cluster = cluster;
     uint16_t next_cluster = next_dir_cluster(volume, last_cluster);
@@ -732,8 +732,19 @@ int cat16_writefile(cat16_volume_t *volume, const char *path, uint8_t *filedata,
     strncpy(entry.extension, extension, sizeof(entry.extension));
     int remaining_bytes = bytes_to_write;
     int offset = 0;
+    //empty files can't allocate a cluster. 
+    // set first logical cluster to 0 and size to zero
+    if (bytes_to_write == 0){
+        result = add_dir_entry(volume, &entry, 0x20, 0x0000, bytes_to_write);
+        if (result < 0){
+            volume->last_error_code = result;
+            return result;
+        }
+        return 0;
+    }
     uint16_t cluster = find_free_cluster(volume);
     if (cluster == 0xFFFF){
+
         volume->last_error_code = -ENOSPC;
         return -ENOSPC;
     }
@@ -756,6 +767,13 @@ int cat16_writefile(cat16_volume_t *volume, const char *path, uint8_t *filedata,
         if (remaining_bytes > 0){
             uint16_t next_cluster = find_free_cluster(volume);
             if (next_cluster == 0xFFFF){
+                // free clusters
+                uint16_t current_cluster = first_logical_cluster;
+                while (current_cluster >= 0x0002 && current_cluster <= 0xFFEF){
+                    uint16_t next_in_chain = read_fat_entry(volume, current_cluster);
+                    write_fat_entry(volume, current_cluster, 0x0000);
+                    current_cluster = next_in_chain;
+                }
                 volume->last_error_code = -ENOSPC;
                 return -ENOSPC;
             }
@@ -768,6 +786,13 @@ int cat16_writefile(cat16_volume_t *volume, const char *path, uint8_t *filedata,
     // add the directory entry for the new file
     result = add_dir_entry(volume, &entry, 0x20, first_logical_cluster, bytes_to_write); // 0x20 is the attribute for a normal file
     if (result < 0){
+        //free clusters
+        uint16_t current_cluster = first_logical_cluster;
+        while (current_cluster >= 0x0002 && current_cluster <= 0xFFEF){
+            uint16_t next_in_chain = read_fat_entry(volume, current_cluster);
+            write_fat_entry(volume, current_cluster, 0x0000);
+            current_cluster = next_in_chain;
+        }
         volume->last_error_code = result;
         return result;
     }
