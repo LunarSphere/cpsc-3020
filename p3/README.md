@@ -25,7 +25,7 @@ if you dont do this ar will not recreate the library from scratch it will just u
 ## To use
 
 supose you wanted to use the library compile your code like this
-`gcc -o executable_name workqueuetest1.c libworkqueue.a`
+`gcc -o executable_name test.c libworkqueue.a`
 
 example compile library and implementation code
 gcc -o test  test.c libworkqueue.a
@@ -45,7 +45,7 @@ makefile -> makes code compilation ez
 Design Choices
 
 - fopen + fseek = oepn the file and then jump around with an offset of bytes. great if the file is too bing to load into vritual memory -> buffer + jump around | i think this would be easier to explain on a quiz.
-- mmap -> we could overlay our bootsector struct on top of the buffer to easily get to the variables we want in our struct -> map file onto ptr array in virtual memory
+- memset & memcmp = compiler would through errors since cstrings are expected to have a null terminator
 
 ```shell
 make
