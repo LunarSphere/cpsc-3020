@@ -2,7 +2,7 @@
 Student: Kevius Tribble
 Instructor: Jacob Sorber
 CPSC 3020
-11/9/2025
+11/10/2025
 */
 
 #include "cat16.h"
@@ -24,7 +24,7 @@ CPSC 3020
 #define ENTRY_SIZE 32
 #define MAX_DIR_ENTRIES 9999
 #define max_number_of_tokens 99999
-#define FINAL_AVAILABLE_CLUSTER (TOTAL_SECTORS - ROOT_DIR_END_SECTOR + 1)
+#define FINAL_AVAILABLE_CLUSTER 0xFFEF
 
 struct cat16_volume{
     long image_size;
@@ -35,6 +35,7 @@ struct cat16_volume{
     uint16_t total_sectors;
     FILE *image_buffer;
     int last_error_code; 
+    int last_free_cluster;
 };
 
 typedef struct cat16_dir_entry cat16_dir_entry_t;
@@ -83,14 +84,21 @@ static uint16_t next_dir_cluster(cat16_volume_t *volume, uint16_t cluster){
 
 // move through the fat looking for a free cluster. returns the cluster number of the first free cluster found.
 static uint16_t find_free_cluster(cat16_volume_t *volume){
-    for (uint16_t cluster = 0x0002; cluster <= FINAL_AVAILABLE_CLUSTER; cluster++){
-        uint16_t value = read_fat_entry(volume, cluster); // raw value. next_dir_cluster would also return 0 for 0xFFFF
+    if (volume->last_free_cluster < 0x0002 || volume->last_free_cluster > FINAL_AVAILABLE_CLUSTER){
+        volume->last_free_cluster = 0x0002;
+    }
+    uint16_t cluster = volume->last_free_cluster; 
+    while(cluster >= 0x0002 && cluster <= FINAL_AVAILABLE_CLUSTER){
+        uint16_t value = read_fat_entry(volume, cluster); // the value of the cluster links to
         if (value == 0x0000){
+            volume-> last_free_cluster = cluster;
             return cluster;
         }
+        cluster++;
     }
-    return 0xFFFF; // no free clusters found | out of space
+    return 0xFFFF; // no free clusters found my disk is out of space
 }
+
 
 //zero out a cluster in the data region.
 static void zero_out_cluster(cat16_volume_t *volume, uint16_t cluster){
@@ -142,7 +150,7 @@ static cat16_dir_entry_t search_directory(cat16_volume_t *volume, const char *fi
     uint16_t cluster = dir_cluster;
     int start_sector = ROOT_DIR_START_SECTOR;
     int end_sector = ROOT_DIR_END_SECTOR;
-    if (dir_cluster != 0x0000){ // subdirectory. one sector per cluster
+    if (dir_cluster != 0x0000){ // in a subdirectory 
         start_sector = 97 + (dir_cluster - 2);
         end_sector = start_sector + 1;
     }
@@ -339,7 +347,6 @@ static int write_dir_entry(cat16_volume_t *volume, cat16_dir_entry_t *entry, uin
     entry->last_write_date = 0;
     entry->first_logical_cluster = first_logical_cluster;
     entry->file_size = bytes_to_write;
-    // the DIRECTORY we are writing into is entry->parent_cluster. (first_logical_cluster is what the new entry points to)
     uint16_t cluster = entry->parent_cluster;
     int start_sector = ROOT_DIR_START_SECTOR;
     int end_sector = ROOT_DIR_END_SECTOR;
@@ -397,7 +404,7 @@ static int add_dir_entry(cat16_volume_t *volume, cat16_dir_entry_t *entry, uint8
         }
         result = write_dir_entry(volume, entry, attributes, first_logical_cluster, bytes_to_write);
         if (result == 1){
-            return -ENOSPC; // no free entry found after growing directory
+            return -ENOSPC; 
         }
     }
     return 0; // success
@@ -523,6 +530,8 @@ cat16_volume_t *cat16_mount(const char *image_path){
         free(volume);
         return NULL;
     }
+    volume->last_error_code = 0;
+    volume->last_free_cluster = 0x0002;
     return volume;
 }
 
@@ -664,7 +673,7 @@ int cat16_unlink(cat16_volume_t *volume, const char *path){
     fseek(volume->image_buffer, entry.byte_offset, SEEK_SET);
     fwrite(entry.filename, sizeof(entry.filename), 1, volume->image_buffer);
     uint16_t cluster = entry.first_logical_cluster;
-    while (cluster >= 0x0002 && cluster <= 0xFFEF){
+    while (cluster >= 0x0002 && cluster <= FINAL_AVAILABLE_CLUSTER){
         // find next logical cluster
         // go to start of the fat 
         // I can jump to the first cluster then just follow jumping around 
@@ -702,7 +711,11 @@ int cat16_writefile(cat16_volume_t *volume, const char *path, uint8_t *filedata,
     if (volume == NULL){
         return -EINVAL;
     }
-    if (path == NULL || filedata == NULL){
+    // file data can be null iff bytes to write is 0 
+    if (bytes_to_write != 0 && filedata == NULL){
+        return -EINVAL;
+    }
+    if (path == NULL){
         volume->last_error_code = -EINVAL;
         return -EINVAL;
     }
@@ -744,7 +757,6 @@ int cat16_writefile(cat16_volume_t *volume, const char *path, uint8_t *filedata,
     }
     uint16_t cluster = find_free_cluster(volume);
     if (cluster == 0xFFFF){
-
         volume->last_error_code = -ENOSPC;
         return -ENOSPC;
     }
@@ -788,7 +800,7 @@ int cat16_writefile(cat16_volume_t *volume, const char *path, uint8_t *filedata,
     if (result < 0){
         //free clusters
         uint16_t current_cluster = first_logical_cluster;
-        while (current_cluster >= 0x0002 && current_cluster <= 0xFFEF){
+        while (current_cluster >= 0x0002 && current_cluster <= FINAL_AVAILABLE_CLUSTER){
             uint16_t next_in_chain = read_fat_entry(volume, current_cluster);
             write_fat_entry(volume, current_cluster, 0x0000);
             current_cluster = next_in_chain;
@@ -796,7 +808,6 @@ int cat16_writefile(cat16_volume_t *volume, const char *path, uint8_t *filedata,
         volume->last_error_code = result;
         return result;
     }
-
     return 0;
 }
 
@@ -863,7 +874,7 @@ cat16_dirent_t *cat16_listdir(cat16_volume_t *volume, const char *path, size_t *
     // other wise I gotta search each sector and find the next one with the fat table
     uint16_t cluster = entry.first_logical_cluster;
     int sector = 97 + (cluster - 2);
-    while (cluster >= 0x0002 && cluster <= 0xFFEF){
+    while (cluster >= 0x0002 && cluster <= FINAL_AVAILABLE_CLUSTER){
         scan_sector(volume, sector, dir_entries, entries_read);
         // find next logical cluster
         uint16_t next_cluster = read_fat_entry(volume, cluster);
@@ -956,10 +967,10 @@ int cat16_mkdir(cat16_volume_t *volume, const char *path){
         return -ENOSPC;
     }
     write_fat_entry(volume, cluster, 0xFFFF); // mark the first cluster as end of file in the FAT
-    // zero out the new directory cluster (pass the CLUSTER, zero_out_cluster converts it to a sector)
+    // zero out the new directories cluster
     zero_out_cluster(volume, cluster);
 
-    // write the directory entry for the new directory (into the parent. lookup.parent_cluster, 0 = root)
+    // write the directory entry to the parent
     cat16_dir_entry_t entry;
     strncpy(entry.filename, filename, sizeof(entry.filename));
     strncpy(entry.extension, extension, sizeof(entry.extension));
@@ -971,13 +982,13 @@ int cat16_mkdir(cat16_volume_t *volume, const char *path){
         return dir_write_result;
     }
 
-    // write the "." entry (into the NEW directory)
+    // write the "." entry to the new sub directory
     cat16_dir_entry_t dot_entry;
     memcpy(dot_entry.filename, ".       ", 8); //once again mem is used because c-strings are intended to have a null terminator
     memcpy(dot_entry.extension, "   ", 3);
     dot_entry.parent_cluster = cluster;
     write_dir_entry(volume, &dot_entry, 0x10, cluster, 0);
-    // write the ".." entry (into the NEW directory, points at the parent. 0 if the parent is root)
+    // write the ".." entry to the new sub directory
     cat16_dir_entry_t dotdot_entry;
     memcpy(dotdot_entry.filename, "..      ", 8);
     memcpy(dotdot_entry.extension, "   ", 3);
@@ -1044,7 +1055,7 @@ int cat16_rmdir(cat16_volume_t *volume, const char *path){
     fseek(volume->image_buffer, entry.byte_offset, SEEK_SET);
     fwrite(entry.filename, sizeof(entry.filename), 1, volume->image_buffer);
     uint16_t cluster = entry.first_logical_cluster;
-    while (cluster  >= 0x0002 && cluster <= 0xFFEF){
+    while (cluster  >= 0x0002 && cluster <= FINAL_AVAILABLE_CLUSTER){
         // find next logical cluster
         // go to start of the fat 
         // I can jump to the first cluster then just follow jumping around 

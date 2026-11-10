@@ -35,7 +35,8 @@ gcc -o test  test.c libworkqueue.a
 
 ## KNOWN PROBLEMS
 
-Writes are slow as sectors fill up. LIkely becuase I check every availible cluster 0002 - 0xffef 
+TBD
+
 
 ## DESIGN
 
@@ -48,6 +49,8 @@ Design Choices
 
 - fopen + fseek = oepn the file and then jump around with an offset of bytes. great if the file is too bing to load into vritual memory -> buffer + jump around | i think this would be easier to explain on a quiz.
 - memset & memcmp = compiler would throw errors since cstrings are expected to have a null terminator
+  strring functions are designed to go until a null terminator using strncpy should theoretically work but the comipler throws a a warning.
+  memcpy/cmp can work any data not just strings given that you tell it the length so its great for our usecase witha. non null terminated file name
 
 ```shell
 make
